@@ -1,0 +1,162 @@
+// Public endpoint: onboarding de activación de plan — minkadigital.com/activar
+// Fase 2 de la escalera: el prospecto (normalmente post-diagnóstico) pide activar su asistente.
+// Captura el "paquete de conocimiento" del negocio → lead/opportunity en GHL (tag onboarding-<plan>)
+// → ping Telegram con TODO lo necesario para correr el pipeline demo_bot/tenant sin buscar nada.
+//
+// El fulfillment de v1 es semi-automático a propósito: Gerónimo recibe el ping, corre
+// scripts/demo_bot.py con los datos ya capturados, y agenda la videollamada de bienvenida (P1).
+// La automatización total del provisioning es fase posterior (requiere pago en línea + BotFather).
+
+const GHL_BASE = "https://services.leadconnectorhq.com";
+const GHL_TOKEN = process.env.GHL_TOKEN_LOCATION || "";
+const GHL_LOCATION = process.env.GHL_LOCATION_ID || "";
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
+const VERSION = "2021-07-28";
+
+const ALLOWED_ORIGINS = [
+  "https://minkadigital.com",
+  "https://www.minkadigital.com",
+  "http://localhost:3000",
+];
+
+const PLANES = new Set(["respuesta-ia", "funnel-esencial", "sistema-crecimiento"]);
+
+const hits = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const rec = (hits.get(ip) || []).filter((t) => now - t < 3600_000);
+  rec.push(now);
+  hits.set(ip, rec);
+  return rec.length > 4;
+}
+
+const clip = (s, n) => String(s ?? "").slice(0, n).trim();
+
+async function ghl(method, path, body) {
+  const r = await fetch(`${GHL_BASE}${path}`, {
+    method,
+    headers: {
+      "Authorization": `Bearer ${GHL_TOKEN}`,
+      "Version": VERSION,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      "User-Agent": "MinkaOnboarding/1.0",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const txt = await r.text();
+  let data;
+  try { data = JSON.parse(txt); } catch { data = { _raw: txt }; }
+  return { status: r.status, data };
+}
+
+module.exports = async (req, res) => {
+  const origin = req.headers.origin || "";
+  const corsOk = ALLOWED_ORIGINS.includes(origin) || /https:\/\/.*\.vercel\.app$/.test(origin);
+  if (corsOk) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "method" });
+
+  try {
+    const b = req.body || {};
+    if (b.website_hp) return res.status(200).json({ ok: true }); // honeypot
+
+    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0] || "?";
+    if (rateLimited(ip)) return res.status(429).json({ error: "Demasiadas solicitudes — intenta más tarde." });
+
+    const p = {
+      plan: clip(b.plan, 40),
+      nombre: clip(b.nombre, 80),
+      email: clip(b.email, 120).toLowerCase(),
+      whatsapp: clip(b.whatsapp, 24),
+      negocio: clip(b.negocio, 120),
+      giro: clip(b.giro, 100),
+      sitio: clip(b.sitio, 200),
+      redes: clip(b.redes, 300),
+      queVendes: clip(b.queVendes, 600),
+      precios: clip(b.precios, 600),
+      horarios: clip(b.horarios, 200),
+      politicas: clip(b.politicas, 500),
+      tono: clip(b.tono, 200),
+      canalPreferido: clip(b.canalPreferido, 60),
+    };
+    if (!PLANES.has(p.plan)) return res.status(400).json({ error: "Plan inválido." });
+    if (!p.nombre || !p.email.includes("@") || !p.negocio || !p.whatsapp) {
+      return res.status(400).json({ error: "Faltan datos: nombre, email, WhatsApp y negocio." });
+    }
+
+    // Upsert del contacto + tag de onboarding
+    let contactId = null;
+    const found = await ghl("GET",
+      `/contacts/search/duplicate?locationId=${GHL_LOCATION}&email=${encodeURIComponent(p.email)}`);
+    if (found.status === 200 && found.data.contact) contactId = found.data.contact.id;
+    const base = {
+      locationId: GHL_LOCATION,
+      name: p.nombre,
+      email: p.email,
+      phone: p.whatsapp,
+      companyName: p.negocio,
+      tags: ["onboarding", `onboarding-${p.plan}`, "minkadigital.com"],
+      source: "activar-web",
+    };
+    let ghlDetail = "";
+    if (contactId) await ghl("PUT", `/contacts/${contactId}`, base);
+    else {
+      const created = await ghl("POST", "/contacts/", base);
+      contactId = created.data?.contact?.id || null;
+      if (!contactId) ghlDetail = `create:${created.status}:${JSON.stringify(created.data).slice(0, 160)}`;
+    }
+    if (contactId) {
+      const note = [
+        `🚀 SOLICITUD DE ACTIVACIÓN — plan: ${p.plan}`,
+        "",
+        "PAQUETE DE CONOCIMIENTO (para demo_bot.py / tenant):",
+        `  · Negocio: ${p.negocio} (${p.giro})`,
+        `  · Sitio: ${p.sitio || "—"}`,
+        `  · Redes: ${p.redes || "—"}`,
+        `  · Qué vende: ${p.queVendes}`,
+        `  · Precios: ${p.precios || "—"}`,
+        `  · Horarios: ${p.horarios || "—"}`,
+        `  · Políticas: ${p.politicas || "—"}`,
+        `  · Tono deseado: ${p.tono || "—"}`,
+        `  · Canal preferido: ${p.canalPreferido || "—"}`,
+        "",
+        "SIGUIENTE PASO (Gerónimo): videollamada de bienvenida + correr pipeline demo_bot",
+        `Fecha: ${new Date().toISOString()}`,
+      ].join("\n");
+      await ghl("POST", `/contacts/${contactId}/notes`, { body: note.slice(0, 4900) });
+    }
+
+    // Ping accionable a Telegram
+    if (TG_TOKEN && TG_CHAT) {
+      const cmd = `railway run python scripts/demo_bot.py --prospecto ${p.negocio.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 26)} --display "${p.negocio}"${p.sitio ? ` --sitio ${p.sitio}` : ""}`;
+      const text = [
+        `🚀 ACTIVACIÓN ${p.plan.toUpperCase()}`,
+        `👤 ${p.nombre} · ${p.negocio} (${p.giro})`,
+        `📱 ${p.whatsapp} · ${p.email}`,
+        `🌐 ${p.sitio || p.redes || "sin sitio"}`,
+        "",
+        `▶️ Comando sugerido:`,
+        cmd,
+        "",
+        "1) Correr pipeline · 2) Crear bot @BotFather · 3) Videollamada bienvenida",
+      ].join("\n");
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TG_CHAT, text }),
+      }).catch(() => {});
+    }
+
+    // Telemetría honesta: si el CRM falló, que se vea en la respuesta (el ping a Telegram salió
+    // igual, así el lead no se pierde) — sin exponer datos sensibles.
+    return res.status(200).json({ ok: true, crm: contactId ? "ok" : "failed", detail: ghlDetail || undefined });
+  } catch (e) {
+    return res.status(500).json({ error: "Error registrando tu solicitud." });
+  }
+};

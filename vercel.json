@@ -9,6 +9,12 @@
     },
     "api/diagnostico.js": {
       "maxDuration": 60
+    },
+    "api/onboarding.js": {
+      "maxDuration": 15
+    },
+    "api/portal-status.js": {
+      "maxDuration": 10
     }
   }
 }
