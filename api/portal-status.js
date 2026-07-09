@@ -22,36 +22,55 @@ function rateLimited(ip) {
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
 
+// Deriva estado + pasos HONESTOS (el diagnóstico solo se marca si de verdad se hizo) + un CTA
+// concreto de "próximo paso" para que el cliente nunca quede sin saber qué sigue.
 function estadoFromTags(tags) {
   const t = (tags || []).map((x) => String(x).toLowerCase());
   const plan = (t.find((x) => x.startsWith("onboarding-")) || "").replace("onboarding-", "") || null;
+  const hizoDiag = t.includes("diagnostico-p0");
+
   if (t.includes("bot-activo")) {
     return { fase: "activo", titulo: "Tu asistente está ACTIVO 🎉", plan,
       pasos: [
-        { done: true, txt: "Diagnóstico" },
-        { done: true, txt: "Paquete de conocimiento recibido" },
-        { done: true, txt: "Asistente configurado y entrenado" },
-        { done: true, txt: "En operación — atendiendo a tus clientes" },
-      ] };
+        { done: true, txt: "Solicitud recibida", desc: "Registramos tu negocio y tu plan." },
+        { done: true, txt: "Paquete de conocimiento", desc: "Tu asistente aprendió tu negocio." },
+        { done: true, txt: "Configurado y entrenado", desc: "Listo con el tono y la info de tu marca." },
+        { done: true, txt: "En operación", desc: "Atendiendo a tus clientes 24/7." },
+      ],
+      cta: { titulo: "¿Quieres mejorar a tu asistente?",
+             desc: "Envíanos más información de tu negocio (promociones, nuevos productos, políticas) y lo actualizamos.",
+             accionTxt: "Mejorar mi asistente", accion: `activar${plan ? `?plan=${plan}` : ""}` } };
   }
+
   if (t.some((x) => x.startsWith("onboarding"))) {
     return { fase: "activando", titulo: "Estamos armando tu asistente 🔧", plan,
       pasos: [
-        { done: true, txt: "Diagnóstico" },
-        { done: true, txt: "Paquete de conocimiento recibido" },
-        { done: false, txt: "Configuración y entrenamiento (24-48 h)" },
-        { done: false, txt: "Videollamada de bienvenida + entrega" },
-      ] };
+        { done: true, txt: "Solicitud recibida", desc: "Tenemos tu plan y tus datos de contacto." },
+        { done: true, txt: "Paquete de conocimiento recibido", desc: "Ya tenemos la info que nos diste de tu negocio." },
+        { done: false, txt: "Configuración y entrenamiento (24-48 h)", desc: "Estamos construyendo y entrenando tu asistente con tu información." },
+        { done: false, txt: "Videollamada de bienvenida + entrega", desc: "Te contactamos por WhatsApp para agendarla y entregarte tu bot funcionando." },
+      ],
+      cta: { titulo: "Mientras lo construimos, ayúdanos a que quede perfecto",
+             desc: "Entre más sepa tu asistente (precios, horarios, promociones, preguntas típicas), mejor atiende. Agrega o completa la info de tu negocio cuando quieras.",
+             accionTxt: "Completar el conocimiento de mi negocio", accion: `activar${plan ? `?plan=${plan}` : ""}` } };
   }
-  if (t.includes("diagnostico-p0")) {
-    return { fase: "diagnosticado", titulo: "Tienes tu diagnóstico — el siguiente paso es activar", plan,
+
+  if (hizoDiag) {
+    return { fase: "diagnosticado", titulo: "Tienes tu diagnóstico listo — el siguiente paso es activar", plan,
       pasos: [
-        { done: true, txt: "Diagnóstico realizado" },
-        { done: false, txt: "Activa tu plan en minkadigital.com/activar" },
-      ] };
+        { done: true, txt: "Diagnóstico realizado", desc: "Identificamos dónde automatizar tu negocio." },
+        { done: false, txt: "Activa tu asistente", desc: "Elige tu plan y en 24-48 h lo tienes funcionando." },
+      ],
+      cta: { titulo: "Activa tu asistente",
+             desc: "Ya sabemos qué automatizar en tu negocio. El siguiente paso es ponerlo a trabajar.",
+             accionTxt: "Activar mi asistente", accion: "activar" } };
   }
-  return { fase: "lead", titulo: "Te tenemos registrado — empieza con tu diagnóstico gratis", plan,
-    pasos: [{ done: false, txt: "Haz tu diagnóstico en minkadigital.com/diagnostico" }] };
+
+  return { fase: "lead", titulo: "Te tenemos registrado 👋", plan,
+    pasos: [{ done: false, txt: "Haz tu diagnóstico gratis", desc: "3 minutos para saber qué automatizar primero en tu negocio." }],
+    cta: { titulo: "Empieza con tu diagnóstico gratis",
+           desc: "En 3 minutos te decimos dónde se te está yendo el dinero y qué automatizar primero.",
+           accionTxt: "Hacer mi diagnóstico gratis", accion: "diagnostico" } };
 }
 
 module.exports = async (req, res) => {
