@@ -1,0 +1,13 @@
+{
+  "name": "minka-webhooks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Webhook receiver for GoHighLevel events — Minka Digital",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod --yes --scope geronimoglezs-projects"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
