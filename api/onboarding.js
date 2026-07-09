@@ -7,12 +7,9 @@
 // scripts/demo_bot.py con los datos ya capturados, y agenda la videollamada de bienvenida (P1).
 // La automatización total del provisioning es fase posterior (requiere pago en línea + BotFather).
 
-const GHL_BASE = "https://services.leadconnectorhq.com";
-const GHL_TOKEN = process.env.GHL_TOKEN_LOCATION || "";
-const GHL_LOCATION = process.env.GHL_LOCATION_ID || "";
+const crm = require("../lib/crm");
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
-const VERSION = "2021-07-28";
 
 const ALLOWED_ORIGINS = [
   "https://minkadigital.com",
@@ -33,23 +30,6 @@ function rateLimited(ip) {
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
 
-async function ghl(method, path, body) {
-  const r = await fetch(`${GHL_BASE}${path}`, {
-    method,
-    headers: {
-      "Authorization": `Bearer ${GHL_TOKEN}`,
-      "Version": VERSION,
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "User-Agent": "MinkaOnboarding/1.0",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const txt = await r.text();
-  let data;
-  try { data = JSON.parse(txt); } catch { data = { _raw: txt }; }
-  return { status: r.status, data };
-}
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin || "";
@@ -90,47 +70,26 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Faltan datos: nombre, email, WhatsApp y negocio." });
     }
 
-    // Upsert del contacto + tag de onboarding
-    let contactId = null;
-    const found = await ghl("GET",
-      `/contacts/search/duplicate?locationId=${GHL_LOCATION}&email=${encodeURIComponent(p.email)}`);
-    if (found.status === 200 && found.data.contact) contactId = found.data.contact.id;
-    const base = {
-      locationId: GHL_LOCATION,
-      name: p.nombre,
-      email: p.email,
-      phone: p.whatsapp,
-      companyName: p.negocio,
-      tags: ["onboarding", `onboarding-${p.plan}`, "minkadigital.com"],
-      source: "activar-web",
-    };
-    let ghlDetail = "";
-    if (contactId) await ghl("PUT", `/contacts/${contactId}`, base);
-    else {
-      const created = await ghl("POST", "/contacts/", base);
-      contactId = created.data?.contact?.id || null;
-      if (!contactId) ghlDetail = `create:${created.status}:${JSON.stringify(created.data).slice(0, 160)}`;
-    }
-    if (contactId) {
-      const note = [
-        `🚀 SOLICITUD DE ACTIVACIÓN — plan: ${p.plan}`,
-        "",
-        "PAQUETE DE CONOCIMIENTO (para demo_bot.py / tenant):",
-        `  · Negocio: ${p.negocio} (${p.giro})`,
-        `  · Sitio: ${p.sitio || "—"}`,
-        `  · Redes: ${p.redes || "—"}`,
-        `  · Qué vende: ${p.queVendes}`,
-        `  · Precios: ${p.precios || "—"}`,
-        `  · Horarios: ${p.horarios || "—"}`,
-        `  · Políticas: ${p.politicas || "—"}`,
-        `  · Tono deseado: ${p.tono || "—"}`,
-        `  · Canal preferido: ${p.canalPreferido || "—"}`,
-        "",
-        "SIGUIENTE PASO (Gerónimo): videollamada de bienvenida + correr pipeline demo_bot",
-        `Fecha: ${new Date().toISOString()}`,
-      ].join("\n");
-      await ghl("POST", `/contacts/${contactId}/notes`, { body: note.slice(0, 4900) });
-    }
+    const note = [
+      `🚀 SOLICITUD DE ACTIVACIÓN — plan: ${p.plan}`,
+      "",
+      "PAQUETE DE CONOCIMIENTO (para demo_bot.py / tenant):",
+      `  · Negocio: ${p.negocio} (${p.giro})`,
+      `  · Sitio: ${p.sitio || "—"}`,
+      `  · Redes: ${p.redes || "—"}`,
+      `  · Qué vende: ${p.queVendes}`,
+      `  · Precios: ${p.precios || "—"}`,
+      `  · Horarios: ${p.horarios || "—"}`,
+      `  · Políticas: ${p.politicas || "—"}`,
+      `  · Tono deseado: ${p.tono || "—"}`,
+      `  · Canal preferido: ${p.canalPreferido || "—"}`,
+      "",
+      "SIGUIENTE PASO (Gerónimo): videollamada de bienvenida + correr pipeline demo_bot",
+      `Fecha: ${new Date().toISOString()}`,
+    ].join("\n");
+    const crmRes = await crm.pushLead(
+      { nombre: p.nombre, email: p.email, whatsapp: p.whatsapp, negocio: p.negocio, source: "activar-web" },
+      { tags: ["onboarding", `onboarding-${p.plan}`, "minkadigital.com"], note });
 
     // Ping accionable a Telegram
     if (TG_TOKEN && TG_CHAT) {
@@ -155,7 +114,7 @@ module.exports = async (req, res) => {
 
     // Telemetría honesta: si el CRM falló, que se vea en la respuesta (el ping a Telegram salió
     // igual, así el lead no se pierde) — sin exponer datos sensibles.
-    return res.status(200).json({ ok: true, crm: contactId ? "ok" : "failed", detail: ghlDetail || undefined });
+    return res.status(200).json({ ok: true, crm: crmRes.ok ? "ok" : (crmRes.driver === "none" ? "skipped" : "failed"), driver: crmRes.driver, detail: crmRes.detail });
   } catch (e) {
     return res.status(500).json({ error: "Error registrando tu solicitud." });
   }

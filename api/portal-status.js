@@ -3,10 +3,7 @@
 // WhatsApp (verificación ligera; no hay password todavía). Devuelve SOLO estado derivado de tags
 // de GHL — nunca notas internas ni datos de otros contactos. Dashboard completo = fase posterior.
 
-const GHL_BASE = "https://services.leadconnectorhq.com";
-const GHL_TOKEN = process.env.GHL_TOKEN_LOCATION || "";
-const GHL_LOCATION = process.env.GHL_LOCATION_ID || "";
-const VERSION = "2021-07-28";
+const crm = require("../lib/crm"); // adaptador Odoo/GHL/none (decisión 2026-07-08: Odoo primero)
 
 const ALLOWED_ORIGINS = [
   "https://minkadigital.com",
@@ -78,19 +75,16 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Necesito tu correo y los últimos 4 dígitos de tu WhatsApp." });
     }
 
-    const r = await fetch(`${GHL_BASE}/contacts/search/duplicate?locationId=${GHL_LOCATION}&email=${encodeURIComponent(email)}`, {
-      headers: { "Authorization": `Bearer ${GHL_TOKEN}`, "Version": VERSION, "Accept": "application/json" },
-    });
-    const data = await r.json().catch(() => ({}));
-    const c = data?.contact;
+    const c = await crm.findByEmail(email);
     // Respuesta uniforme si no existe o no verifica (anti-enumeración de correos)
     const fail = { error: "No encontré ese registro. Verifica correo y últimos 4 dígitos, o haz tu diagnóstico gratis." };
-    if (!c) return res.status(404).json(fail);
+    if (c.unavailable) return res.status(503).json({ error: "El portal está en mantenimiento — escríbenos por WhatsApp." });
+    if (!c.found) return res.status(404).json(fail);
     const phone = String(c.phone || "").replace(/\D/g, "");
     if (!phone.endsWith(tel4)) return res.status(404).json(fail);
 
     const estado = estadoFromTags(c.tags);
-    return res.status(200).json({ ok: true, nombre: c.firstName || c.name || "", negocio: c.companyName || "", ...estado });
+    return res.status(200).json({ ok: true, nombre: c.nombre || "", negocio: c.negocio || "", ...estado });
   } catch (e) {
     return res.status(500).json({ error: "Error consultando tu estado." });
   }

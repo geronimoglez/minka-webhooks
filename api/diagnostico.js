@@ -1,19 +1,12 @@
 // Public endpoint: P0 "Diagnóstico de Automatización" — minkadigital.com/diagnostico
-// Flujo (100% automático, sin intervención del operador):
-//   form del sitio → este endpoint → LLM (OpenRouter, tier capaz) genera el diagnóstico →
-//   lead + reporte a GHL (tag diagnostico-p0) → ping Telegram → JSON del reporte al sitio.
+// Flujo (100% automático): form del sitio → LLM (OpenRouter, tier capaz) → lead+reporte al CRM
+// vía adaptador (Odoo primero, GHL guardado — decisión 2026-07-08) → ping Telegram → JSON al sitio.
 //
-// Spec de negocio: workspace-director/knowledge/paquetes-comerciales.md (P0 = lead-magnet) y
-// plan-prospeccion-minka.md (P0 es el destino de todo el tráfico).
-//
-// Postura pública igual que precalifica.js: sin firma (form público), rate limiting best-effort
-// aquí + infra Vercel. Guardrails: caps de tamaño de input, honeypot anti-bot, timeout del LLM,
-// y el prompt trata el input del usuario como DATOS (anti prompt-injection: no puede cambiar
-// el formato de salida ni los paquetes que recomendamos).
+// Spec de negocio: workspace-director/knowledge/paquetes-comerciales.md (P0 = lead-magnet).
+// Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
-const GHL_BASE = "https://services.leadconnectorhq.com";
-const GHL_TOKEN = process.env.GHL_TOKEN_LOCATION || "";
-const GHL_LOCATION = process.env.GHL_LOCATION_ID || "";
+const crm = require("../lib/crm"); // adaptador Odoo/GHL/none
+
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
 const OR_KEY = process.env.OPENROUTER_API_KEY || "";
@@ -25,17 +18,13 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
 ];
 
-const VERSION = "2021-07-28";
-
-// Rate limit best-effort por instancia (la infra de Vercel es la capa real, como en precalifica)
 const hits = new Map();
 function rateLimited(ip) {
   const now = Date.now();
-  const rec = hits.get(ip) || [];
-  const recent = rec.filter((t) => now - t < 3600_000);
-  recent.push(now);
-  hits.set(ip, recent);
-  return recent.length > 6; // máx 6 diagnósticos/hora/IP
+  const rec = (hits.get(ip) || []).filter((t) => now - t < 3600_000);
+  rec.push(now);
+  hits.set(ip, rec);
+  return rec.length > 6; // máx 6 diagnósticos/hora/IP
 }
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
@@ -111,72 +100,6 @@ async function callLLM(payload) {
   }
 }
 
-async function ghl(method, path, body) {
-  const r = await fetch(`${GHL_BASE}${path}`, {
-    method,
-    headers: {
-      "Authorization": `Bearer ${GHL_TOKEN}`,
-      "Version": VERSION,
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "User-Agent": "MinkaDiagnostico/1.0",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const txt = await r.text();
-  let data;
-  try { data = JSON.parse(txt); } catch { data = { _raw: txt }; }
-  return { status: r.status, data };
-}
-
-async function pushLead(p, report) {
-  if (!GHL_TOKEN || !GHL_LOCATION) return "ghl-skipped";
-  // upsert por email
-  let contactId = null;
-  const found = await ghl("GET",
-    `/contacts/search/duplicate?locationId=${GHL_LOCATION}&email=${encodeURIComponent(p.email)}`);
-  if (found.status === 200 && found.data.contact) contactId = found.data.contact.id;
-
-  const base = {
-    locationId: GHL_LOCATION,
-    name: p.nombre,
-    email: p.email,
-    phone: p.whatsapp || undefined,
-    companyName: p.negocio,
-    tags: ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)],
-    source: "diagnostico-web",
-  };
-  if (contactId) {
-    await ghl("PUT", `/contacts/${contactId}`, base);
-  } else {
-    const created = await ghl("POST", "/contacts/", base);
-    contactId = created.data?.contact?.id || null;
-  }
-  if (contactId && report) {
-    const note = [
-      "🤖 Diagnóstico P0 automático (minkadigital.com/diagnostico)",
-      "",
-      `Resumen: ${report.resumen}`,
-      "",
-      "Cuellos de botella:",
-      ...(report.cuellos || []).map((c, i) => `  ${i + 1}. ${c.titulo} — ${c.detalle}`),
-      "",
-      "Quick wins:",
-      ...(report.quickwins || []).map((q, i) => `  ${i + 1}. ${q.titulo}`),
-      "",
-      `Horas/semana recuperables: ~${report.horas_semana}`,
-      `Plan recomendado: ${report.plan?.slug} — ${report.plan?.porque}`,
-      "",
-      `Dolor declarado: ${p.dolor}`,
-      `Volumen: ${p.volumen} · Canal: ${p.canal} · Giro: ${p.giro}`,
-      p.sitio ? `Sitio: ${p.sitio}` : "",
-      `Fecha: ${new Date().toISOString()}`,
-    ].filter(Boolean).join("\n");
-    await ghl("POST", `/contacts/${contactId}/notes`, { body: note.slice(0, 4900) });
-  }
-  return contactId ? "ghl-ok" : "ghl-failed";
-}
-
 async function pingTelegram(p, report) {
   if (!TG_TOKEN || !TG_CHAT) return;
   const text = [
@@ -206,7 +129,7 @@ module.exports = async (req, res) => {
 
   try {
     const b = req.body || {};
-    if (b.website_hp) return res.status(200).json({ ok: true }); // honeypot: bot llenó el campo oculto
+    if (b.website_hp) return res.status(200).json({ ok: true }); // honeypot
 
     const ip = (req.headers["x-forwarded-for"] || "").split(",")[0] || "?";
     if (rateLimited(ip)) return res.status(429).json({ error: "Demasiados diagnósticos — intenta en un rato." });
@@ -234,8 +157,33 @@ module.exports = async (req, res) => {
       return res.status(502).json({ error: "No pude generar tu diagnóstico — inténtalo de nuevo." });
     }
 
+    const note = [
+      "🤖 Diagnóstico P0 automático (minkadigital.com/diagnostico)",
+      "",
+      `Resumen: ${report.resumen}`,
+      "",
+      "Cuellos de botella:",
+      ...(report.cuellos || []).map((c, i) => `  ${i + 1}. ${c.titulo} — ${c.detalle}`),
+      "",
+      "Quick wins:",
+      ...(report.quickwins || []).map((q, i) => `  ${i + 1}. ${q.titulo}`),
+      "",
+      `Horas/semana recuperables: ~${report.horas_semana}`,
+      `Plan recomendado: ${report.plan?.slug} — ${report.plan?.porque}`,
+      "",
+      `Dolor declarado: ${p.dolor}`,
+      `Volumen: ${p.volumen} · Canal: ${p.canal} · Giro: ${p.giro}`,
+      p.sitio ? `Sitio: ${p.sitio}` : "",
+      `Fecha: ${new Date().toISOString()}`,
+    ].filter(Boolean).join("\n");
+
     // Lead + aviso en paralelo; la respuesta al usuario no espera fallas de CRM
-    const side = Promise.allSettled([pushLead(p, report), pingTelegram(p, report)]);
+    const side = Promise.allSettled([
+      crm.pushLead(
+        { nombre: p.nombre, email: p.email, whatsapp: p.whatsapp, negocio: p.negocio, source: "diagnostico-web" },
+        { tags: ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)], note }),
+      pingTelegram(p, report),
+    ]);
     if (typeof res.waitUntil === "function") res.waitUntil(side); else await side;
 
     return res.status(200).json({ ok: true, report });
