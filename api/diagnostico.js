@@ -6,6 +6,7 @@
 // Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
 const crm = require("../lib/crm"); // adaptador Odoo/GHL/none
+const { renderDiagnosticoHTML, slugify } = require("../lib/diagnostico_html");
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
@@ -177,13 +178,31 @@ module.exports = async (req, res) => {
       `Fecha: ${new Date().toISOString()}`,
     ].filter(Boolean).join("\n");
 
-    // Lead + aviso en paralelo; la respuesta al usuario no espera fallas de CRM
-    const side = Promise.allSettled([
-      crm.pushLead(
+    // Lead → (si Odoo) adjuntar el diagnóstico como HTML durable en la oportunidad, para que no se
+    // evapore. Aviso a Telegram en paralelo. La respuesta al usuario no espera ninguna falla de CRM.
+    const persist = (async () => {
+      const led = await crm.pushLead(
         { nombre: p.nombre, email: p.email, whatsapp: p.whatsapp, negocio: p.negocio, source: "diagnostico-web" },
-        { tags: ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)], note }),
-      pingTelegram(p, report),
-    ]);
+        { tags: ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)], note });
+      if (led && led.ok && led.id && crm.driver() === "odoo") {
+        const fecha = new Date().toISOString().slice(0, 10);
+        const html = renderDiagnosticoHTML(p, report, { fecha });
+        const filename = `diagnostico-${slugify(p.negocio || p.nombre)}-${fecha}.html`;
+        const att = await crm.attachToLead(led.id, {
+          filename, mimetype: "text/html", base64: Buffer.from(html, "utf8").toString("base64") });
+        return { led, att };
+      }
+      return { led };
+    })();
+    // Log de fallas: persist/telegram corren en segundo plano y allSettled se traga los errores.
+    // Sin esto, una falla total de Odoo (key rotada, timeout) sería invisible en los logs de Vercel.
+    const side = Promise.allSettled([persist, pingTelegram(p, report)]).then((rs) => {
+      for (const r of rs) {
+        if (r.status === "rejected") console.error("[diagnostico] persist/telegram rechazado:", r.reason);
+        else if (r.value?.led && r.value.led.ok === false) console.error("[diagnostico] CRM falló:", r.value.led.detail);
+        else if (r.value?.att && r.value.att.ok === false) console.error("[diagnostico] attach falló:", r.value.att.detail);
+      }
+    });
     if (typeof res.waitUntil === "function") res.waitUntil(side); else await side;
 
     return res.status(200).json({ ok: true, report });
