@@ -19,7 +19,7 @@ process.env.ODOO_WAKE_BACKOFF_MS = "5";
 process.env.ODOO_WAKE_MAX_MS = "500";
 
 const CRM_PATH = require.resolve("../lib/crm.js");
-let { odooRpc } = require(CRM_PATH);
+let { odooRpc, pushLead, __resetUid } = require(CRM_PATH);
 
 let pass = 0, fail = 0;
 function check(cond, label) {
@@ -62,12 +62,17 @@ async function main() {
     check(st.n === 1, "B: exactamente 1 fetch (single-shot → sin duplicados)");
   }
 
-  // D: error de negocio (data.error) NO se reintenta
+  // D: error de negocio (data.error) NO se reintenta Y se sanea. NO propaga data.error.data.message
+  //    (que puede eco-ar PII del prospecto — ship-review 2026-07-13); sólo la clase de excepción.
   {
-    const st = mockFetch([{ error: { message: "validation-failed" } }, { result: 9 }]);
+    const st = mockFetch([{ error: { data: {
+      name: "odoo.exceptions.ValidationError",
+      message: 'Teléfono +52 33 1234 5678 de "Juan Pérez" (juan@x.com) inválido.',
+    } } }, { result: 9 }]);
     let msg = "";
     try { await odooRpc("object", "execute_kw", [], { retries: 2 }); } catch (e) { msg = e.message; }
-    check(msg === "validation-failed", "D: error de negocio se propaga con su mensaje");
+    check(msg === "odoo-rejected:ValidationError", "D: error de negocio propaga sólo la clase (saneado)");
+    check(!/Juan Pérez|juan@x\.com|1234 5678/.test(msg), "D: el mensaje propagado NO contiene PII");
     check(st.n === 1, "D: error de negocio NO se reintenta (1 fetch)");
   }
 
@@ -77,6 +82,27 @@ async function main() {
     const r = await odooRpc("common", "authenticate", [], { retries: 2 });
     check(r === 7, "E: 5xx se reintenta y luego devuelve el result");
     check(st.n === 3, "E: 3 fetch (2× 5xx + 1 ok)");
+  }
+
+  // F: regresión de PRIVACIDAD (ship-review 2026-07-13) — end-to-end por pushLead. Ante un error de
+  //    validación de Odoo cuyo mensaje eco-a PII, el `detail` resultante (que onboarding.js devuelve
+  //    en el HTTP y diagnostico.js loguea) NO debe contener email/teléfono/nombre del prospecto.
+  {
+    __resetUid();
+    const PII = { nombre: "Ana Gómez", email: "ana.gomez@gmail.com", whatsapp: "+52 33 9876 5432", negocio: "Estética Luz" };
+    mockFetch([
+      { result: 7 },   // authenticate → uid
+      { result: [] },  // res.partner search → sin match (fuerza create)
+      { error: { data: {   // res.partner create → ValidationError con PII interpolada
+        name: "odoo.exceptions.ValidationError",
+        message: `Teléfono ${PII.whatsapp} de "${PII.nombre}" (${PII.email}) inválido.`,
+      } } },
+    ]);
+    const r = await pushLead(PII, { tags: ["diagnostico-p0"], note: "x" });
+    const anyPII = [PII.nombre, PII.email, PII.whatsapp].some((v) => String(r.detail).includes(v));
+    check(r.ok === false, "F: pushLead reporta fallo honesto (ok:false)");
+    check(r.detail === "odoo-rejected:ValidationError", "F: detail es el token saneado");
+    check(!anyPII, "F: detail NO filtra PII del prospecto (nombre/email/teléfono)");
   }
 
   // C: presupuesto total agotado → el retry se corta (re-require con MAX chico y backoff que lo excede)

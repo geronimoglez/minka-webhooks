@@ -198,6 +198,8 @@ module.exports = async (req, res) => {
     // Sin esto, una falla total de Odoo (key rotada, timeout) sería invisible en los logs de Vercel.
     const side = Promise.allSettled([persist, pingTelegram(p, report)]).then((rs) => {
       for (const r of rs) {
+        // `detail` viene ya saneado desde crm.js (token diagnóstico sin PII, p.ej. "odoo-rejected:ValidationError"):
+        // el mensaje crudo de Odoo — que podía eco-ar email/tel/nombre — ya no se propaga (ship-review 2026-07-13).
         if (r.status === "rejected") console.error("[diagnostico] persist/telegram rechazado:", r.reason);
         else if (r.value?.led && r.value.led.ok === false) console.error("[diagnostico] CRM falló:", r.value.led.detail);
         else if (r.value?.att && r.value.att.ok === false) console.error("[diagnostico] attach falló:", r.value.att.detail);

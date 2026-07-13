@@ -30,6 +30,24 @@ function rateLimited(ip) {
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
 
+// Allowlist de `detail` para la respuesta PÚBLICA. crm.js ya sanea en origen (no propaga el mensaje
+// crudo de Odoo, que puede eco-ar PII — ship-review 2026-07-13), pero ésta es la superficie expuesta a
+// internet: defensa en profundidad. Sólo dejamos pasar tokens diagnósticos que genera NUESTRO código;
+// cualquier string inesperado colapsa a "crm-error" para que una regresión futura no pueda filtrar PII.
+const SAFE_DETAIL = [
+  /^odoo-rejected:[A-Za-z0-9_]+$/, // clase de excepción de Odoo, sin PII (ver crm.js)
+  /^odoo-http-\d{3}$/,             // 5xx transitorio del wake
+  /^odoo-auth-failed$/,
+  /^odoo-rpc-failed$/,
+  /^odoo-error$/,
+];
+const safeDetail = (d) => {
+  const s = String(d ?? "");
+  if (!s) return undefined;
+  if (/^CRM sin configurar/.test(s)) return "crm-unconfigured"; // driver "none" (no sensible)
+  return SAFE_DETAIL.some((re) => re.test(s)) ? s : "crm-error";
+};
+
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin || "";
@@ -114,7 +132,7 @@ module.exports = async (req, res) => {
 
     // Telemetría honesta: si el CRM falló, que se vea en la respuesta (el ping a Telegram salió
     // igual, así el lead no se pierde) — sin exponer datos sensibles.
-    return res.status(200).json({ ok: true, crm: crmRes.ok ? "ok" : (crmRes.driver === "none" ? "skipped" : "failed"), driver: crmRes.driver, detail: crmRes.detail });
+    return res.status(200).json({ ok: true, crm: crmRes.ok ? "ok" : (crmRes.driver === "none" ? "skipped" : "failed"), driver: crmRes.driver, detail: safeDetail(crmRes.detail) });
   } catch (e) {
     return res.status(500).json({ error: "Error registrando tu solicitud." });
   }
