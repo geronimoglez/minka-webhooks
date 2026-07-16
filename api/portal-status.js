@@ -1,9 +1,9 @@
 // Public endpoint: estado del cliente — minkadigital.com/portal
 // Fase 3 v1: el cliente consulta el estado de su asistente con email + últimos 4 dígitos de su
 // WhatsApp (verificación ligera; no hay password todavía). Devuelve SOLO estado derivado de tags
-// de GHL — nunca notas internas ni datos de otros contactos. Dashboard completo = fase posterior.
+// del CRM (Odoo) — nunca notas internas ni datos de otros contactos. Dashboard completo = fase posterior.
 
-const crm = require("../lib/crm"); // adaptador Odoo/GHL/none (decisión 2026-07-08: Odoo primero)
+const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
 
 const ALLOWED_ORIGINS = [
   "https://minkadigital.com",

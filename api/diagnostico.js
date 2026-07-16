@@ -1,11 +1,11 @@
 // Public endpoint: P0 "Diagnóstico de Automatización" — minkadigital.com/diagnostico
 // Flujo (100% automático): form del sitio → LLM (OpenRouter, tier capaz) → lead+reporte al CRM
-// vía adaptador (Odoo primero, GHL guardado — decisión 2026-07-08) → ping Telegram → JSON al sitio.
+// vía adaptador Odoo (GHL purgado 2026-07-16) → ping Telegram → JSON al sitio.
 //
 // Spec de negocio: workspace-director/knowledge/paquetes-comerciales.md (P0 = lead-magnet).
 // Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
-const crm = require("../lib/crm"); // adaptador Odoo/GHL/none
+const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
 const { renderDiagnosticoHTML, slugify } = require("../lib/diagnostico_html");
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";

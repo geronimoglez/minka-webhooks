@@ -1,6 +1,6 @@
 // Public endpoint: onboarding de activación de plan — minkadigital.com/activar
 // Fase 2 de la escalera: el prospecto (normalmente post-diagnóstico) pide activar su asistente.
-// Captura el "paquete de conocimiento" del negocio → lead/opportunity en GHL (tag onboarding-<plan>)
+// Captura el "paquete de conocimiento" del negocio → lead/opportunity en Odoo (tag onboarding-<plan>)
 // → ping Telegram con TODO lo necesario para correr el pipeline demo_bot/tenant sin buscar nada.
 //
 // El fulfillment de v1 es semi-automático a propósito: Gerónimo recibe el ping, corre

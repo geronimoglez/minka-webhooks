@@ -1,12 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/ghl.js": {
-      "maxDuration": 10
-    },
-    "api/precalifica.js": {
-      "maxDuration": 15
-    },
     "api/diagnostico.js": {
       "maxDuration": 60
     },
