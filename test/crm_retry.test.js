@@ -19,7 +19,7 @@ process.env.ODOO_WAKE_BACKOFF_MS = "5";
 process.env.ODOO_WAKE_MAX_MS = "500";
 
 const CRM_PATH = require.resolve("../lib/crm.js");
-let { odooRpc, pushLead, __resetUid } = require(CRM_PATH);
+let { odooRpc, pushLead, findByEmail, escLike, __resetUid } = require(CRM_PATH);
 
 let pass = 0, fail = 0;
 function check(cond, label) {
@@ -31,8 +31,9 @@ function check(cond, label) {
 //   function  → se invoca (puede lanzar, simula error de red/abort)
 //   {status?, result?, error?} → respuesta con r.status y r.json()
 function mockFetch(seq) {
-  const state = { n: 0 };
-  global.fetch = async () => {
+  const state = { n: 0, bodies: [] };
+  global.fetch = async (_url, opts) => {
+    state.bodies.push(opts && opts.body);
     const item = seq[Math.min(state.n, seq.length - 1)];
     state.n++;
     if (typeof item === "function") return item();
@@ -103,6 +104,28 @@ async function main() {
     check(r.ok === false, "F: pushLead reporta fallo honesto (ok:false)");
     check(r.detail === "odoo-rejected:ValidationError", "F: detail es el token saneado");
     check(!anyPII, "F: detail NO filtra PII del prospecto (nombre/email/teléfono)");
+  }
+
+  // H: escLike escapa los comodines de SQL LIKE (% _ \) para el operador `=ilike` de Odoo
+  //    (ship-review 2026-07-16). Sin esto un email "%@%" casaría un contacto ARBITRARIO.
+  {
+    check(escLike("%@%") === "\\%@\\%", "H: escapa % (evita casar un contacto arbitrario)");
+    check(escLike("john_doe@x.com") === "john\\_doe@x.com", "H: escapa _ (email literal, no comodín)");
+    check(escLike("a\\b") === "a\\\\b", "H: escapa la backslash");
+    check(escLike("juan@x.com") === "juan@x.com", "H: email normal es no-op");
+  }
+
+  // G: end-to-end — findByEmail("%@%") debe mandar a Odoo el patrón ESCAPADO en el dominio `=ilike`,
+  //    no el crudo. Prueba que el fix está cableado en el sink real (no sólo el helper).
+  {
+    __resetUid();
+    const st = mockFetch([{ result: 5 }, { result: [] }]); // authenticate uid, luego res.partner search
+    const r = await findByEmail("%@%");
+    check(r.found === false, "G: sin match → found:false (no casa un contacto arbitrario)");
+    const domain = JSON.parse(st.bodies[1]).params.args[5]; // [[["email","=ilike", <patrón>]]]
+    const pattern = domain[0][0][2];
+    check(pattern === "\\%@\\%", "G: el dominio =ilike lleva el patrón escapado");
+    check(!/(^|[^\\])%/.test(pattern), "G: no queda ningún % sin escapar en el patrón");
   }
 
   // C: presupuesto total agotado → el retry se corta (re-require con MAX chico y backoff que lo excede)

