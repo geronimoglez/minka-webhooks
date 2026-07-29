@@ -6,7 +6,7 @@
 // Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
 const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
-const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify } = require("../lib/diagnostico_html");
+const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, telegramUrl } = require("../lib/diagnostico_html");
 
 // waitUntil real de Vercel: mantiene viva la lambda para el trabajo en segundo plano DESPUÉS de
 // responder. `res.waitUntil` NO existe con la firma (req,res) del runtime Node — el código anterior
@@ -480,7 +480,10 @@ const handler = async (req, res) => {
     // prometa un envío que no va a ocurrir (driver "none", ODOO_* sin configurar, o kill-switch
     // apagado) — volver a prometer de más es exactamente el bug que esta fase cierra. Es un dato
     // síncrono: NO depende del resultado del envío, que pasa después en segundo plano.
-    return res.status(200).json({ ok: true, report, mail: MAIL_ENABLED && crm.driver() === "odoo" });
+    return res.status(200).json({
+      ok: true, report, mail: MAIL_ENABLED && crm.driver() === "odoo",
+      telegramDeepLink: telegramUrl(p, report),
+    });
   } catch (e) {
     return res.status(500).json({ error: "Error generando el diagnóstico." });
   }
