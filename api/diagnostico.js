@@ -33,6 +33,10 @@ function waitUntil(promise) {
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
 const OR_KEY = process.env.OPENROUTER_API_KEY || "";
+// Una sola dirección, sin comas/punto y coma/corchetes/espacios ni caracteres de control.
+// Es el MISMO patrón que usa el sink de correo en lib/crm.js — deliberadamente, para que la
+// entrada y el sink no puedan divergir. Ver el comentario largo en el handler.
+const EMAIL_STRICT = /^[^\s,;:<>"'\\]+@[^\s,;:<>"'\\]+\.[^\s,;:<>"'\\]+$/;
 const MODEL = process.env.DIAGNOSTICO_MODEL || "xiaomi/mimo-v2.5-pro";
 // Fallback de proveedor distinto por si MiMo se cae o satura (docs/modelos-policy.md: el fallback
 // del tier capaz es deepseek-v4-pro). Un hipo de un solo modelo dejaba de generar diagnósticos.
@@ -326,8 +330,17 @@ const handler = async (req, res) => {
       volumen: clip(b.volumen, 60),
       sitio: clip(b.sitio, 200),
     };
-    if (!p.nombre || !p.email.includes("@") || !p.negocio || !p.dolor) {
-      return res.status(400).json({ error: "Faltan datos (nombre, email, negocio y tu dolor principal)." });
+    // SEGURIDAD — validación estricta del correo EN LA ENTRADA, no sólo en el sink.
+    // `.includes("@")` dejaba pasar "yo@x.com,victima@y.com" y saltos de línea. Ese valor se
+    // guarda en `crm.lead.email_from` (lib/crm.js:192) y DOS consumidores lo usan después como
+    // cabecera de correo: el envío del diagnóstico (saneado en su sink) y —el grave—
+    // `scripts/p0_nurture.py:135`, que corre en producción con P0_NURTURE_SEND=1 y lo pasa a
+    // `mail.mail.email_to` SIN sanear. Sin esta guarda el formulario público es un relay: el
+    // atacante deja el correo envenenado hoy y la secuencia de nurturing se lo manda a un tercero
+    // 2-7 días después, desde el dominio de Minka. Se ataja aquí para que el dato sucio NUNCA
+    // entre a Odoo; los sinks siguen saneando (defensa en profundidad, no en lugar de).
+    if (!p.nombre || !EMAIL_STRICT.test(p.email) || !p.negocio || !p.dolor) {
+      return res.status(400).json({ error: "Faltan datos (nombre, email válido, negocio y tu dolor principal)." });
     }
     if (!OR_KEY) return res.status(503).json({ error: "Diagnóstico temporalmente no disponible." });
 
