@@ -8,10 +8,60 @@
 const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
 const { renderDiagnosticoHTML, slugify } = require("../lib/diagnostico_html");
 
+// waitUntil real de Vercel: mantiene viva la lambda para el trabajo en segundo plano DESPUÉS de
+// responder. `res.waitUntil` NO existe con la firma (req,res) del runtime Node — el código anterior
+// siempre caía en `await side` y la respuesta esperaba a Odoo (auditoría 2026-07-29, §6).
+//
+// Se implementa el MISMO protocolo que `@vercel/functions` sin instalar el paquete: su `waitUntil`
+// es literalmente `globalThis[Symbol.for("@vercel/request-context")].get().waitUntil(promise)`
+// (verificado leyendo wait-until.js + get-context.js de la versión 3.7.6). El paquete arrastra 25
+// dependencias / 9 MB (execa, cross-spawn, zod, jose) — superficie de supply-chain y un `npm
+// install` en el build que este repo hoy no necesita, en el endpoint del que cuelga TODO el funnel.
+// Si el runtime no expone el contexto, `waitUntil()` devuelve false y degradamos a `await side`.
+const REQ_CONTEXT = Symbol.for("@vercel/request-context");
+function waitUntil(promise) {
+  try {
+    const fn = globalThis[REQ_CONTEXT]?.get?.()?.waitUntil;
+    if (typeof fn !== "function") return false;
+    fn(promise);
+    return true;
+  } catch {
+    return false; // contexto ausente o runtime distinto → el caller hace await
+  }
+}
+
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
 const OR_KEY = process.env.OPENROUTER_API_KEY || "";
 const MODEL = process.env.DIAGNOSTICO_MODEL || "xiaomi/mimo-v2.5-pro";
+// Fallback de proveedor distinto por si MiMo se cae o satura (docs/modelos-policy.md: el fallback
+// del tier capaz es deepseek-v4-pro). Un hipo de un solo modelo dejaba de generar diagnósticos.
+const MODEL_FALLBACK = process.env.DIAGNOSTICO_MODEL_FALLBACK || "deepseek/deepseek-v4-pro";
+// Presupuesto TOTAL del LLM (patrón de lib/crm.js): los reintentos nunca pueden exceder el
+// maxDuration de 60 s de vercel.json. 3 intentos × 18 s ≤ 45 s, quedan ~15 s de margen.
+const LLM_ATTEMPT_MS = 18_000;
+const LLM_BUDGET_MS = 45_000;
+const LLM_RETRY_BACKOFF_MS = 700;
+// Presupuesto del endpoint completo, por debajo del maxDuration 60 de vercel.json. Acota la espera
+// por el CRM: cada RPC de Odoo tiene su timeout (10 s en lib/crm.js) pero la CADENA no — un push
+// son ~8 RPCs. Si el LLM falla rápido y Odoo se arrastra, sin esta cota la lambda moriría a los 60 s
+// y el usuario vería un 504 de plataforma en vez de nuestro error.
+// Overrideable por env para poder seguir a `maxDuration` si algún día cambia (y para los tests).
+const ENDPOINT_BUDGET_MS = (() => {
+  const v = Number(process.env.DIAGNOSTICO_BUDGET_MS);
+  return Number.isFinite(v) ? Math.max(500, Math.min(58_000, v)) : 50_000;
+})();
+
+// Resuelve con el valor de `promise` si llega dentro de `ms`; con `null` si sigue PENDIENTE.
+// Ojo: no cancela nada — la promesa sigue viva y el caller la recoge después en segundo plano.
+function settleWithin(promise, ms) {
+  if (!(ms > 0)) return Promise.resolve(null);
+  let timer;
+  return Promise.race([
+    promise.then((v) => { clearTimeout(timer); return v; }),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); }),
+  ]);
+}
 
 const ALLOWED_ORIGINS = [
   "https://minkadigital.com",
@@ -19,13 +69,27 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
 ];
 
+// Rate-limit best-effort por IP. 6/h castigaba a usuarios legítimos detrás del CGNAT de las
+// operadoras mexicanas (Telcel), que comparten IP pública — y en un pico viral eso es perder un
+// lead que ya llenó 11 campos. El `Map` es por instancia serverless, así que el límite real ya se
+// diluye entre instancias: sirve contra un script torpe, no contra un ataque.
+const RL_MAX = (() => {
+  const v = Number(process.env.DIAGNOSTICO_RL_MAX);
+  return Number.isFinite(v) ? Math.max(1, Math.min(200, v)) : 15;
+})();
+const RL_WINDOW_MS = 3600_000;
+const RL_MAX_IPS = 5000; // cota de memoria: sin esto el Map crece sin límite en una lambda caliente
+
 const hits = new Map();
 function rateLimited(ip) {
   const now = Date.now();
-  const rec = (hits.get(ip) || []).filter((t) => now - t < 3600_000);
+  const rec = (hits.get(ip) || []).filter((t) => now - t < RL_WINDOW_MS);
   rec.push(now);
   hits.set(ip, rec);
-  return rec.length > 6; // máx 6 diagnósticos/hora/IP
+  if (hits.size > RL_MAX_IPS) { // poda de entradas vencidas (sólo cuando hace falta)
+    for (const [k, v] of hits) if (!v.length || now - v[v.length - 1] >= RL_WINDOW_MS) hits.delete(k);
+  }
+  return rec.length > RL_MAX;
 }
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
@@ -60,8 +124,8 @@ Los tres niveles de Minka (para tu recomendación):
 Si el negocio es demasiado temprano hasta para respuesta-ia, dilo con cariño en "porque" y
 recomiéndales ejecutar los quickwins primero.`;
 
-async function callLLM(payload) {
-  const user = [
+function userPrompt(payload) {
+  return [
     `Nombre: ${payload.nombre} · Negocio: ${payload.negocio} · Giro: ${payload.giro}`,
     `Etapa: ${payload.etapa}`,
     `¿Dónde están sus clientes?: ${payload.canal}`,
@@ -70,9 +134,39 @@ async function callLLM(payload) {
     `Volumen aprox. de mensajes/clientes por semana: ${payload.volumen}`,
     payload.sitio ? `Sitio/redes: ${payload.sitio}` : "",
   ].filter(Boolean).join("\n");
+}
 
+// Normaliza lo que devuelve el LLM para que el front NUNCA reciba un `cuellos`/`quickwins` que no
+// sea array. El backend ya era defensivo con `(report.cuellos || [])` para la nota del CRM, pero el
+// front hacía `.map()` a pelo → pantalla en blanco justo después de guardar el lead (auditoría §6).
+// Se sanea EN ORIGEN: así queda blindado también el sitio que ya está desplegado hoy.
+function normalizeReport(r) {
+  if (!r || typeof r !== "object" || !r.plan || typeof r.plan !== "object") return null;
+  // Se devuelve SÓLO el shape conocido (nada de `...r`): lo que el LLM invente de más no viaja al
+  // browser ni al HTML archivado. Cada campo se coacciona a string → la nota del CRM nunca imprime
+  // "undefined" cuando el modelo omite un `detalle`.
+  const list = (v, keys) => (Array.isArray(v) ? v : [])
+    .filter((x) => x && typeof x === "object" && keys.some((k) => x[k]))
+    .map((x) => {
+      const o = {};
+      for (const k of keys) o[k] = String(x[k] ?? "");
+      if ("gratis" in x) o.gratis = !!x.gratis;
+      return o;
+    });
+  const horas = Number(r.horas_semana);
+  return {
+    resumen: typeof r.resumen === "string" ? r.resumen : "",
+    cuellos: list(r.cuellos, ["titulo", "detalle"]),
+    quickwins: list(r.quickwins, ["titulo", "como"]),
+    // 168 = horas que tiene una semana: si el modelo alucina "5000 h/sem" no lo publicamos.
+    horas_semana: Number.isFinite(horas) ? Math.max(0, Math.min(168, Math.round(horas))) : 0,
+    plan: { slug: String(r.plan.slug || ""), porque: String(r.plan.porque || "") },
+  };
+}
+
+async function callLLMOnce(user, model, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45_000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -83,7 +177,7 @@ async function callLLM(payload) {
         "X-Title": "minka-diagnostico-p0",
       },
       body: JSON.stringify({
-        model: MODEL,
+        model,
         max_tokens: 1800,
         response_format: { type: "json_object" },
         messages: [
@@ -92,32 +186,91 @@ async function callLLM(payload) {
         ],
       }),
     });
+    // 429/5xx de OpenRouter = transitorio → reintentable. Antes se ignoraba el status: `data` venía
+    // sin `choices`, se devolvía null y el endpoint cortaba con 502 sin intentar nada más.
+    if (!r.ok) throw new Error(`openrouter-http-${r.status}`);
     const data = await r.json();
+    if (data?.error) throw new Error("openrouter-error"); // sin body: puede eco-ar el prompt (PII)
     const raw = data?.choices?.[0]?.message?.content || "";
     const m = raw.match(/\{[\s\S]*\}/);
-    return m ? JSON.parse(m[0]) : null;
+    if (!m) throw new Error("llm-no-json");
+    // PRIVACIDAD: el SyntaxError de JSON.parse incluye un FRAGMENTO del texto que falló al parsear
+    // — y ese texto es el diagnóstico del negocio del prospecto (nombre, dolor, giro). Si se dejara
+    // propagar, el mensaje acabaría en los logs de Vercel. Mismo criterio que lib/crm.js con los
+    // errores de Odoo: sólo viaja un token diagnóstico sin PII.
+    let parsed;
+    try {
+      parsed = JSON.parse(m[0]);
+    } catch {
+      throw new Error("llm-json-invalido");
+    }
+    const report = normalizeReport(parsed);
+    if (!report) throw new Error("llm-report-incompleto");
+    return report;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function pingTelegram(p, report) {
+// 1 reintento con el modelo primario + 1 pasada con el fallback de otro proveedor, todo dentro de un
+// presupuesto total acotado. Nunca lanza: devuelve null si se agotaron intentos o presupuesto.
+async function callLLM(payload) {
+  const user = userPrompt(payload);
+  const deadline = Date.now() + LLM_BUDGET_MS;
+  const attempts = [MODEL, MODEL, MODEL_FALLBACK];
+  for (let i = 0; i < attempts.length; i++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 1000) break; // sin presupuesto útil → degradar limpio (el lead ya está salvo)
+    try {
+      return await callLLMOnce(user, attempts[i], Math.min(LLM_ATTEMPT_MS, remaining));
+    } catch (e) {
+      // Sólo tokens diagnósticos PROPIOS (`llm-json-invalido`, `openrouter-http-429`…) o, ante un
+      // error inesperado, su CLASE. Nunca el mensaje crudo: puede eco-ar el prompt o la salida del
+      // modelo, ambos con datos del prospecto.
+      const own = /^(openrouter-|llm-)/.test(String(e?.message || ""));
+      const tag = own ? e.message : `${e?.name || "Error"}`;
+      console.error(`[diagnostico] LLM intento ${i + 1}/${attempts.length} (${attempts[i]}) falló: ${tag}`);
+      if (i < attempts.length - 1 && Date.now() + LLM_RETRY_BACKOFF_MS < deadline) {
+        await new Promise((r) => setTimeout(r, LLM_RETRY_BACKOFF_MS));
+      }
+    }
+  }
+  return null;
+}
+
+// Aviso a Gerónimo. Sale SIEMPRE, también cuando el LLM falló (antes sólo salía en el camino feliz:
+// un hipo de OpenRouter dejaba el lead sin ningún aviso humano — auditoría §6).
+// Si además el CRM falló, este mensaje es el ÚNICO registro del prospecto → va con todo el formulario.
+async function pingTelegram(p, report, { crmOk = true } = {}) {
   if (!TG_TOKEN || !TG_CHAT) return;
   const text = [
-    "🧲 Nuevo diagnóstico P0 (web)",
+    report ? "🧲 Nuevo diagnóstico P0 (web)" : "⚠️ Lead P0 SIN diagnóstico — el LLM falló",
     `👤 ${p.nombre} · ${p.negocio} (${p.giro}, ${p.etapa})`,
     `📱 ${p.whatsapp || "—"} · ${p.email}`,
     `😖 Dolor: ${p.dolor.slice(0, 140)}`,
-    `📦 Plan recomendado: ${report?.plan?.slug || "—"} · ~${report?.horas_semana ?? "?"} h/sem recuperables`,
-  ].join("\n");
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TG_CHAT, text }),
-  }).catch(() => {});
+    report
+      ? `📦 Plan recomendado: ${report?.plan?.slug || "—"} · ~${report?.horas_semana ?? "?"} h/sem recuperables`
+      : "📦 Sin reporte automático — contáctalo tú.",
+    crmOk ? "" : "🔴 El CRM TAMPOCO lo guardó — este mensaje es el único registro. Cárgalo a mano:",
+    crmOk ? "" : `   Canal: ${p.canal} · Volumen: ${p.volumen}`,
+    crmOk ? "" : `   Procesos: ${p.procesos.slice(0, 200)}`,
+    crmOk || !p.sitio ? "" : `   Sitio: ${p.sitio}`,
+  ].filter(Boolean).join("\n");
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TG_CHAT, text }),
+    });
+    if (!r.ok) console.error("[diagnostico] telegram respondió HTTP", r.status);
+  } catch (e) {
+    // Sólo la CLASE del error: la URL de este fetch lleva el TELEGRAM_BOT_TOKEN incrustado en el
+    // path, y un mensaje de error que la incluyera filtraría el token a los logs de Vercel.
+    console.error("[diagnostico] telegram falló:", e?.name || "Error");
+  }
 }
 
-module.exports = async (req, res) => {
+const handler = async (req, res) => {
   const origin = req.headers.origin || "";
   const corsOk = ALLOWED_ORIGINS.includes(origin) || /https:\/\/.*\.vercel\.app$/.test(origin);
   if (corsOk) {
@@ -128,6 +281,7 @@ module.exports = async (req, res) => {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "method" });
 
+  const startedAt = Date.now();
   try {
     const b = req.body || {};
     if (b.website_hp) return res.status(200).json({ ok: true }); // honeypot
@@ -153,8 +307,38 @@ module.exports = async (req, res) => {
     }
     if (!OR_KEY) return res.status(503).json({ error: "Diagnóstico temporalmente no disponible." });
 
+    // ── BLINDAJE ANTI-PÉRDIDA ────────────────────────────────────────────────────────────────
+    // El lead se guarda ANTES de depender del LLM. Antes el push al CRM vivía después de callLLM:
+    // un fallo de OpenRouter evaporaba a un prospecto que ya había llenado 11 campos (auditoría §6).
+    // Va EN PARALELO con el LLM (no en serie) para que el blindaje no cueste latencia: la lambda
+    // ya estaba esperando al LLM de todos modos. `pushLead` nunca lanza (lib/crm.js lo envuelve);
+    // el .catch es cinturón y tirantes para que un throw inesperado no tumbe el endpoint.
+    const leadInput = { nombre: p.nombre, email: p.email, whatsapp: p.whatsapp, negocio: p.negocio,
+      source: "diagnostico-web" };
+    const leadTags = ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)];
+    const leadPromise = crm.pushLead(leadInput, { tags: leadTags })
+      .catch((e) => ({ ok: false, driver: crm.driver(), detail: String(e?.message || e).slice(0, 200) }));
+
     const report = await callLLM(p);
-    if (!report || !report.plan) {
+    // Se espera al lead sólo lo que quede del presupuesto: normalmente ya terminó (corrió en
+    // paralelo con el LLM). Si Odoo se arrastra, `led` viene null = PENDIENTE (≠ fallido) y el push
+    // se recoge después en segundo plano — nunca se dispara un segundo push sobre el mismo email.
+    const led = await settleWithin(leadPromise, ENDPOINT_BUDGET_MS - (Date.now() - startedAt));
+    const crmPending = led === null;              // sigue en vuelo, NO es un fallo
+    const crmFailed = !!(led && led.ok === false); // fallo confirmado
+    if (crmFailed) console.error("[diagnostico] CRM falló (lead pre-LLM):", led.detail);
+    if (crmPending) console.error("[diagnostico] CRM lento: el lead sigue guardándose en background");
+
+    if (!report) {
+      // Camino triste: el prospecto SÍ quedó registrado y Gerónimo SÍ se entera. Se pierde el
+      // reporte automático, no el lead. El aviso se manda DESPUÉS de que el push termine (el mismo,
+      // nunca otro) para que el "🔴 el CRM tampoco lo guardó" refleje el resultado real y no una
+      // suposición: cuando el LLM falla, ese mensaje puede ser el único registro del prospecto.
+      const tail = (async () => {
+        const settled = crmPending ? await leadPromise : led;
+        await pingTelegram(p, null, { crmOk: !!(settled && settled.ok && settled.id) });
+      })();
+      if (!waitUntil(tail)) await tail;
       return res.status(502).json({ error: "No pude generar tu diagnóstico — inténtalo de nuevo." });
     }
 
@@ -178,37 +362,54 @@ module.exports = async (req, res) => {
       `Fecha: ${new Date().toISOString()}`,
     ].filter(Boolean).join("\n");
 
-    // Lead → (si Odoo) adjuntar el diagnóstico como HTML durable en la oportunidad, para que no se
-    // evapore. Aviso a Telegram en paralelo. La respuesta al usuario no espera ninguna falla de CRM.
-    const persist = (async () => {
-      const led = await crm.pushLead(
-        { nombre: p.nombre, email: p.email, whatsapp: p.whatsapp, negocio: p.negocio, source: "diagnostico-web" },
-        { tags: ["diagnostico-p0", "minkadigital.com", `etapa-${p.etapa}`.slice(0, 40)], note });
-      if (led && led.ok && led.id && crm.driver() === "odoo") {
-        const fecha = new Date().toISOString().slice(0, 10);
-        const html = renderDiagnosticoHTML(p, report, { fecha });
-        const filename = `diagnostico-${slugify(p.negocio || p.nombre)}-${fecha}.html`;
-        const att = await crm.attachToLead(led.id, {
-          filename, mimetype: "text/html", base64: Buffer.from(html, "utf8").toString("base64") });
-        return { led, att };
+    // Enriquecimiento: el lead ya existe (arriba), aquí sólo se le cuelga la nota del diagnóstico y
+    // el HTML durable. Es trabajo NO crítico → va en segundo plano; si se pierde, el lead sigue.
+    const enrich = (async () => {
+      // Si el push seguía pendiente, aquí se recoge EL MISMO (nunca se lanza otro: dos pushes
+      // concurrentes con un email nuevo podrían crear partner/lead duplicados en Odoo).
+      let finalLed = crmPending ? await leadPromise : led;
+      let leadId = finalLed && finalLed.ok && finalLed.id ? finalLed.id : null;
+      // Si el push pre-LLM falló (Odoo dormido, hipo de red), se reintenta aquí el lead COMPLETO
+      // con la nota: es la última oportunidad de que el prospecto quede en el CRM.
+      if (!leadId) {
+        finalLed = await crm.pushLead(leadInput, { tags: leadTags, note });
+        if (!(finalLed && finalLed.ok && finalLed.id)) return { led: finalLed };
+        leadId = finalLed.id;
+      } else {
+        const noted = await crm.addLeadNote(leadId, note); // 1 RPC en vez de repetir el pushLead
+        if (noted && noted.ok === false) console.error("[diagnostico] nota falló:", noted.detail);
       }
-      return { led };
+      if (crm.driver() !== "odoo") return { led: finalLed };
+      const fecha = new Date().toISOString().slice(0, 10);
+      const html = renderDiagnosticoHTML(p, report, { fecha });
+      const filename = `diagnostico-${slugify(p.negocio || p.nombre)}-${fecha}.html`;
+      const att = await crm.attachToLead(leadId, {
+        filename, mimetype: "text/html", base64: Buffer.from(html, "utf8").toString("base64") });
+      return { led: finalLed, att };
     })();
-    // Log de fallas: persist/telegram corren en segundo plano y allSettled se traga los errores.
+    // Log de fallas: enrich/telegram corren en segundo plano y allSettled se traga los errores.
     // Sin esto, una falla total de Odoo (key rotada, timeout) sería invisible en los logs de Vercel.
-    const side = Promise.allSettled([persist, pingTelegram(p, report)]).then((rs) => {
+    const side = Promise.allSettled([enrich, pingTelegram(p, report, { crmOk: !crmFailed })]).then((rs) => {
       for (const r of rs) {
         // `detail` viene ya saneado desde crm.js (token diagnóstico sin PII, p.ej. "odoo-rejected:ValidationError"):
         // el mensaje crudo de Odoo — que podía eco-ar email/tel/nombre — ya no se propaga (ship-review 2026-07-13).
-        if (r.status === "rejected") console.error("[diagnostico] persist/telegram rechazado:", r.reason);
+        if (r.status === "rejected") console.error("[diagnostico] enrich/telegram rechazado:", r.reason);
         else if (r.value?.led && r.value.led.ok === false) console.error("[diagnostico] CRM falló:", r.value.led.detail);
         else if (r.value?.att && r.value.att.ok === false) console.error("[diagnostico] attach falló:", r.value.att.detail);
       }
     });
-    if (typeof res.waitUntil === "function") res.waitUntil(side); else await side;
+    // Si el runtime expone el contexto, la lambda sigue viva para `side` y el usuario NO espera a
+    // Odoo. Si no, degradamos al `await side` de siempre: más lento, pero nunca se pierde el
+    // enriquecimiento. En ambos casos el lead ya está guardado desde antes del LLM.
+    if (!waitUntil(side)) await side;
 
     return res.status(200).json({ ok: true, report });
   } catch (e) {
     return res.status(500).json({ error: "Error generando el diagnóstico." });
   }
 };
+
+module.exports = handler;
+// Internos expuestos SÓLO para test/diagnostico_llm.test.js (misma convención que lib/crm.js).
+// Vercel toma `module.exports` como handler; colgarle propiedades a la función no lo altera.
+module.exports.__test = { callLLM, normalizeReport, rateLimited, waitUntil, settleWithin, RL_MAX };

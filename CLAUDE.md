@@ -42,10 +42,26 @@ Vivas y necesarias: `ODOO_URL` / `ODOO_DB` / `ODOO_USER` / `ODOO_API_KEY`,
 ## Tests (sin deps; corren con node a secas)
 
 ```powershell
-node test/crm_retry.test.js         # wake-retry de Odoo + saneo de PII + escape de =ilike
-node test/onboarding_cmd.test.js    # shellSafe del "comando sugerido"
-node test/diagnostico_html.test.js  # render del HTML del diagnóstico
+node test/crm_retry.test.js          # wake-retry de Odoo + saneo de PII + escape de =ilike
+node test/onboarding_cmd.test.js     # shellSafe del "comando sugerido"
+node test/diagnostico_html.test.js   # render del HTML del diagnóstico
+node test/diagnostico_llm.test.js    # retry+fallback de modelo, normalizeReport, rate-limit, waitUntil
+node test/diagnostico_flow.test.js   # blindaje: el lead entra al CRM ANTES del LLM (FASE 1)
 ```
+
+## Blindaje anti-pérdida del diagnóstico P0 (FASE 1, 2026-07-29) — no regresar
+
+`api/diagnostico.js` guarda el lead en el CRM **antes** de depender del LLM, y en paralelo (no en
+serie) para no pagar latencia. Invariantes que los tests protegen:
+
+- **`crm.pushLead` arranca antes de `callLLM`.** Si el LLM falla, el prospecto ya está en Odoo y
+  Telegram avisa igual. Mover el push abajo del LLM es exactamente el bug que se arregló.
+- El **enriquecimiento** (nota + adjunto HTML) es trabajo NO crítico: va en segundo plano con
+  `waitUntil`, y usa `crm.addLeadNote` (1 RPC) en vez de repetir el `pushLead` completo (~8 RPCs).
+- `waitUntil` se implementa **sin dependencias**, con el mismo `Symbol.for("@vercel/request-context")`
+  que usa `@vercel/functions`. Si el runtime no lo expone, degrada a `await`. **No instalar el
+  paquete**: arrastra 25 deps y obligaría a un `npm install` en el build que hoy no existe.
+- `normalizeReport` garantiza que `cuellos`/`quickwins` lleguen al front **siempre como array**.
 
 ## Privacidad / seguridad (no regresar)
 
