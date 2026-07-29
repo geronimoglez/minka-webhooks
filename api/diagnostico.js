@@ -6,7 +6,7 @@
 // Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
 const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
-const { renderDiagnosticoHTML, slugify } = require("../lib/diagnostico_html");
+const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify } = require("../lib/diagnostico_html");
 
 // waitUntil real de Vercel: mantiene viva la lambda para el trabajo en segundo plano DESPUÉS de
 // responder. `res.waitUntil` NO existe con la firma (req,res) del runtime Node — el código anterior
@@ -93,6 +93,23 @@ function rateLimited(ip) {
 }
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
+
+// ── Correo del diagnóstico al prospecto (FASE 2) ────────────────────────────────────────────────
+// Copy y remitente viven en constantes A PROPÓSITO: son decisiones de negocio de Gerónimo, no de
+// código, y así se cambian de un vistazo. Todas tienen override por env para poder ajustarlas sin
+// tocar el repo (ojo: en Vercel un cambio de env NO aplica hasta el siguiente deploy).
+//
+// Se manda desde Odoo (mail.mail + addon minka_ses → AWS SES), el mismo camino que ya usa
+// scripts/p0_nurture.py en producción. Ver lib/crm.js:odooSendLeadEmail.
+const MAIL_ENABLED = process.env.DIAGNOSTICO_MAIL_SEND !== "0"; // kill-switch sin tocar código
+const MAIL_SUBJECT = (p) => `Tu diagnóstico digital, ${p.negocio || p.nombre}`;
+// Vacío = el remitente que Odoo ya tiene configurado (noreply@minkadigital.com, identidad verificada
+// en SES). NO ponerlo a otra dirección sin verificarla antes en SES: SES rechaza el envío completo
+// si la Source no es una identidad suya, y quedaríamos otra vez sin mandar el diagnóstico.
+const MAIL_FROM = process.env.DIAGNOSTICO_MAIL_FROM || "";
+// El reply-to sí es libre: no toca el sobre ni la reputación del dominio, sólo a dónde caen las
+// respuestas. hola@ es el buzón público que ya publica el sitio en su footer.
+const MAIL_REPLY_TO = process.env.DIAGNOSTICO_MAIL_REPLY_TO || "hola@minkadigital.com";
 
 const SYSTEM_PROMPT = `Eres el motor de diagnóstico de Minka Digital (Guadalajara, México): una
 agencia IA-nativa que automatiza negocios locales. Recibirás las respuestas de un dueño de negocio
@@ -241,6 +258,24 @@ async function callLLM(payload) {
 // Aviso a Gerónimo. Sale SIEMPRE, también cuando el LLM falló (antes sólo salía en el camino feliz:
 // un hipo de OpenRouter dejaba el lead sin ningún aviso humano — auditoría §6).
 // Si además el CRM falló, este mensaje es el ÚNICO registro del prospecto → va con todo el formulario.
+// Envío crudo a Telegram. Extraído de pingTelegram para poder avisar también de un fallo del correo
+// sin duplicar el fetch (ni el cuidado con el token, que viaja en el PATH de la URL).
+async function tgSend(text) {
+  if (!TG_TOKEN || !TG_CHAT) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TG_CHAT, text }),
+    });
+    if (!r.ok) console.error("[diagnostico] telegram respondió HTTP", r.status);
+  } catch (e) {
+    // Sólo la CLASE del error: la URL de este fetch lleva el TELEGRAM_BOT_TOKEN incrustado en el
+    // path, y un mensaje de error que la incluyera filtraría el token a los logs de Vercel.
+    console.error("[diagnostico] telegram falló:", e?.name || "Error");
+  }
+}
+
 async function pingTelegram(p, report, { crmOk = true } = {}) {
   if (!TG_TOKEN || !TG_CHAT) return;
   const text = [
@@ -256,18 +291,7 @@ async function pingTelegram(p, report, { crmOk = true } = {}) {
     crmOk ? "" : `   Procesos: ${p.procesos.slice(0, 200)}`,
     crmOk || !p.sitio ? "" : `   Sitio: ${p.sitio}`,
   ].filter(Boolean).join("\n");
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TG_CHAT, text }),
-    });
-    if (!r.ok) console.error("[diagnostico] telegram respondió HTTP", r.status);
-  } catch (e) {
-    // Sólo la CLASE del error: la URL de este fetch lleva el TELEGRAM_BOT_TOKEN incrustado en el
-    // path, y un mensaje de error que la incluyera filtraría el token a los logs de Vercel.
-    console.error("[diagnostico] telegram falló:", e?.name || "Error");
-  }
+  await tgSend(text);
 }
 
 const handler = async (req, res) => {
@@ -385,7 +409,39 @@ const handler = async (req, res) => {
       const filename = `diagnostico-${slugify(p.negocio || p.nombre)}-${fecha}.html`;
       const att = await crm.attachToLead(leadId, {
         filename, mimetype: "text/html", base64: Buffer.from(html, "utf8").toString("base64") });
-      return { led: finalLed, att };
+      // FASE 2 — cerrar la promesa: el formulario dice "aquí te mandamos el diagnóstico"; aquí se
+      // manda. Va al final del enriquecimiento porque el lead y el archivo durable son lo que no se
+      // puede perder; el correo es reintentable a mano desde Odoo si algo falla.
+      //
+      // SIN dedup a propósito: cada envío del formulario es un acto deliberado que produce un
+      // diagnóstico NUEVO, así que le corresponde su correo. Colgar el envío del `deduped` del
+      // adjunto (mismo negocio + misma fecha) parecía gratis, pero abría un modo de fallo peor que
+      // el que evitaba: si el primer correo falló, el segundo intento se saltaba en silencio y el
+      // prospecto se quedaba otra vez sin su diagnóstico — justo el bug que esta fase arregla.
+      // El techo contra abuso ya existe aguas arriba (rate-limit por IP).
+      let mail;
+      if (MAIL_ENABLED) {
+        mail = await crm.sendLeadEmail(leadId, {
+          to: p.email,
+          subject: MAIL_SUBJECT(p),
+          html: renderDiagnosticoEmail(p, report, { fecha }),
+          from: MAIL_FROM,
+          replyTo: MAIL_REPLY_TO,
+        });
+        // Un fallo de correo NO puede vivir sólo en los logs de Vercel: nadie los mira, y el hueco
+        // que esta fase cierra existió meses justo por eso. Si el envío falla, Gerónimo se entera
+        // por el mismo canal por el que ya recibe los leads.
+        if (mail && mail.ok === false) {
+          await tgSend([
+            "📪 No pude mandarle el diagnóstico por correo",
+            `👤 ${p.nombre} · ${p.negocio}`,
+            `📧 ${p.email}`,
+            `⚙️ ${mail.detail || "sin detalle"}`,
+            "El reporte SÍ está en Odoo (adjunto en la oportunidad) — puedes reenviárselo desde ahí.",
+          ].join("\n"));
+        }
+      }
+      return { led: finalLed, att, mail };
     })();
     // Log de fallas: enrich/telegram corren en segundo plano y allSettled se traga los errores.
     // Sin esto, una falla total de Odoo (key rotada, timeout) sería invisible en los logs de Vercel.
@@ -393,9 +449,13 @@ const handler = async (req, res) => {
       for (const r of rs) {
         // `detail` viene ya saneado desde crm.js (token diagnóstico sin PII, p.ej. "odoo-rejected:ValidationError"):
         // el mensaje crudo de Odoo — que podía eco-ar email/tel/nombre — ya no se propaga (ship-review 2026-07-13).
-        if (r.status === "rejected") console.error("[diagnostico] enrich/telegram rechazado:", r.reason);
-        else if (r.value?.led && r.value.led.ok === false) console.error("[diagnostico] CRM falló:", r.value.led.detail);
-        else if (r.value?.att && r.value.att.ok === false) console.error("[diagnostico] attach falló:", r.value.att.detail);
+        if (r.status === "rejected") { console.error("[diagnostico] enrich/telegram rechazado:", r.reason); continue; }
+        // Comprobaciones INDEPENDIENTES (antes eran `else if`): un fallo del CRM escondía el del
+        // adjunto, y el del correo no se miraba. Los tres `detail` vienen ya saneados desde crm.js
+        // (token diagnóstico sin PII, p.ej. "odoo-rejected:MailDeliveryException").
+        if (r.value?.led && r.value.led.ok === false) console.error("[diagnostico] CRM falló:", r.value.led.detail);
+        if (r.value?.att && r.value.att.ok === false) console.error("[diagnostico] attach falló:", r.value.att.detail);
+        if (r.value?.mail && r.value.mail.ok === false) console.error("[diagnostico] correo al prospecto falló:", r.value.mail.detail);
       }
     });
     // Si el runtime expone el contexto, la lambda sigue viva para `side` y el usuario NO espera a
@@ -403,7 +463,11 @@ const handler = async (req, res) => {
     // enriquecimiento. En ambos casos el lead ya está guardado desde antes del LLM.
     if (!waitUntil(side)) await side;
 
-    return res.status(200).json({ ok: true, report });
+    // `mail` le dice al front si el diagnóstico VA a salir por correo, para que la pantalla no
+    // prometa un envío que no va a ocurrir (driver "none", ODOO_* sin configurar, o kill-switch
+    // apagado) — volver a prometer de más es exactamente el bug que esta fase cierra. Es un dato
+    // síncrono: NO depende del resultado del envío, que pasa después en segundo plano.
+    return res.status(200).json({ ok: true, report, mail: MAIL_ENABLED && crm.driver() === "odoo" });
   } catch (e) {
     return res.status(500).json({ error: "Error generando el diagnóstico." });
   }

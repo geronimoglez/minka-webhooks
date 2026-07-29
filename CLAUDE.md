@@ -36,7 +36,8 @@ Para verificar un deploy: `curl -s -o /dev/null -w "%{http_code}" https://minka-
 
 Vivas y necesarias: `ODOO_URL` / `ODOO_DB` / `ODOO_USER` / `ODOO_API_KEY`,
 `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`
-(+ opcionales `DIAGNOSTICO_MODEL`, `CRM_DRIVER`, `ODOO_WAKE_*`). Detalle en `.env.example`.
+(+ opcionales `DIAGNOSTICO_MODEL`, `DIAGNOSTICO_MAIL_*`, `CRM_DRIVER`, `ODOO_WAKE_*`).
+Detalle en `.env.example`.
 `GHL_*` / `NOTION_*` / `OPENCLAW_*` / `WEBHOOK_SHARED_SECRET`: eliminadas (eran del webhook GHL borrado).
 
 ## Tests (sin deps; corren con node a secas)
@@ -62,6 +63,33 @@ serie) para no pagar latencia. Invariantes que los tests protegen:
   que usa `@vercel/functions`. Si el runtime no lo expone, degrada a `await`. **No instalar el
   paquete**: arrastra 25 deps y obligaría a un `npm install` en el build que hoy no existe.
 - `normalizeReport` garantiza que `cuellos`/`quickwins` lleguen al front **siempre como array**.
+
+## El diagnóstico SE LE MANDA al prospecto (FASE 2, 2026-07-29) — no regresar
+
+La página promete *"aquí te mandamos el diagnóstico"*; hasta esta fase nada lo mandaba y el reporte
+sólo vivía en la pestaña del navegador. Ahora `api/diagnostico.js` lo envía por correo:
+
+- **Sale por Odoo** (`crm.sendLeadEmail` → `mail.mail` + addon `minka_ses` → AWS SES). Es el mismo
+  camino que ya usa `scripts/p0_nurture.py` en producción: **cero credenciales de correo en Vercel**,
+  misma identidad verificada en SES, y queda en el **chatter del lead**. No meter aquí un SDK de
+  correo ni un segundo remitente: partiría la reputación del dominio.
+- **`email_from` va vacío a propósito** → Odoo usa el suyo (`noreply@minkadigital.com`). Cambiarlo
+  sin verificar antes la dirección en SES tumba TODO el envío. El `reply_to` (hola@) sí es libre.
+- **`send` va con `raise_exception: true`**: por default Odoo marca `state="exception"` y no lanza,
+  así que un rechazo de SES sería invisible y volveríamos a prometer un correo que no sale.
+- **El correo tiene su propio render** (`renderDiagnosticoEmail`), con tablas y estilos inline. El
+  HTML del adjunto usa variables CSS, `@media` y flex/grid: Gmail borra lo primero y Outlook no
+  entiende lo segundo. Son dos envases del mismo contenido — al tocar uno, revisar el otro.
+- **Es trabajo no crítico**: va en el `waitUntil`, al final del enriquecimiento (lead y adjunto
+  primero). Un fallo de correo nunca rompe la respuesta al usuario.
+- **Un fallo de correo avisa por Telegram**, no sólo por `console.error`. Los logs de Vercel no los
+  mira nadie — por eso este hueco duró meses. No quitar ese aviso.
+- **La respuesta 200 lleva `mail: <bool>`** (síncrono: driver odoo + kill-switch encendido). El
+  sitio sólo dice "también te lo mandamos a tu correo" cuando viene `true`. Si algún día el envío
+  se apaga, la pantalla deja de prometerlo sola.
+- **NO se dedupea el envío.** Colgarlo del `deduped` de `attachToLead` parecía gratis pero abría un
+  fallo silencioso: si el primer correo falló, el segundo intento se saltaba y el prospecto se
+  quedaba sin nada. Cada diagnóstico nuevo se entrega; el techo contra abuso es el rate-limit.
 
 ## Privacidad / seguridad (no regresar)
 

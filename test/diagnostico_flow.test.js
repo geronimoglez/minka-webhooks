@@ -7,6 +7,9 @@
 //  C: si el push pre-LLM falla, el enriquecimiento reintenta el lead COMPLETO (con nota).
 //  D: si el CRM falla del todo, el aviso de Telegram carga los datos del formulario (único registro).
 //  E: si Odoo se arrastra, la respuesta NO se cuelga y NO se dispara un segundo push (ship-review).
+//  F: FASE 2 — el prospecto RECIBE su diagnóstico por correo (la promesa del formulario).
+//  G: doble submit del mismo día → un solo correo (no se spamea a alguien que apenas nos conoce).
+//  H: si el correo falla, el usuario igual recibe su diagnóstico y el fallo queda en los logs.
 
 process.env.OPENROUTER_API_KEY = "test-key";
 process.env.DIAGNOSTICO_MODEL = "modelo/primario";
@@ -37,7 +40,15 @@ crm.addLeadNote = async (leadId, note) => {
 };
 crm.attachToLead = async (leadId, file) => {
   calls.push({ fn: "attachToLead", leadId, filename: file.filename });
-  return { ok: true, driver: "odoo", attachmentId: 99 };
+  // `deduped` = el mismo diagnóstico ya estaba archivado (doble submit del mismo día).
+  return { ok: true, driver: "odoo", attachmentId: 99, ...(crmBehavior.attDeduped ? { deduped: true } : {}) };
+};
+crm.sendLeadEmail = async (leadId, m) => {
+  calls.push({ fn: "sendLeadEmail", leadId, to: m.to, subject: m.subject, from: m.from,
+    replyTo: m.replyTo, html: m.html });
+  return crmBehavior.mail === "fail"
+    ? { ok: false, driver: "odoo", detail: "odoo-rejected:MailDeliveryException" }
+    : { ok: true, driver: "odoo", mailId: 5 };
 };
 
 const handler = require("../api/diagnostico.js");
@@ -90,8 +101,8 @@ function fakeRes() {
   return { res, out };
 }
 
-async function run(body, { llm = "ok", push = "ok", delayMs = 0 } = {}) {
-  calls.length = 0; pushCount = 0; crmBehavior = { push, delayMs };
+async function run(body, { llm = "ok", push = "ok", delayMs = 0, attDeduped = false, mail = "ok" } = {}) {
+  calls.length = 0; pushCount = 0; crmBehavior = { push, delayMs, attDeduped, mail };
   mockFetch(llm);
   const { res, out } = fakeRes();
   // IP distinta por corrida: el rate-limit es module-scope y persiste entre casos del test.
@@ -166,6 +177,59 @@ const realLog = console.error;
   check(tgE && !tgE.text.includes("único registro"),
     "E: Telegram NO declara al CRM caído por ir lento");
   check(elapsed < 5000, `E: nada se cuelga esperando indefinidamente (${elapsed} ms)`);
+
+  console.log("F — FASE 2: el prospecto recibe su diagnóstico por correo");
+  out = await run(BODY, { llm: "ok" });
+  const mailF = calls.find((c) => c.fn === "sendLeadEmail");
+  check(!!mailF, "F: se manda el correo del diagnóstico (antes la página lo prometía y nada lo mandaba)");
+  check(mailF && mailF.to === "ana@ejemplo.com", "F: va al correo que capturó el formulario");
+  check(mailF && mailF.leadId === 777, "F: colgado del MISMO lead (queda en su chatter)");
+  check(mailF && mailF.subject === "Tu diagnóstico digital, Tacos Ana", "F: asunto con el nombre del negocio");
+  check(mailF && mailF.from === "", "F: sin remitente propio → usa el que Odoo ya tiene verificado en SES");
+  check(mailF && mailF.replyTo === "hola@minkadigital.com", "F: las respuestas caen en un buzón que se lee");
+  check(mailF && mailF.html.includes("/activar?plan=respuesta-ia"), "F: el correo cierra con CTA a /activar");
+  check(mailF && mailF.html.includes("Tacos Ana") && mailF.html.includes("c1"),
+    "F: el correo lleva el diagnóstico real, no un aviso genérico");
+  const orderF = calls.map((c) => c.fn);
+  check(orderF.indexOf("sendLeadEmail") > orderF.indexOf("attachToLead"),
+    "F: el correo va DESPUÉS de guardar lead y adjunto (lo no perdible primero)");
+
+  console.log("G — el front sabe si el correo va en camino (para no prometer de más)");
+  check(out.body.mail === true, "G: con driver odoo y envío encendido, la respuesta trae mail:true");
+  crm.driver = () => "none";
+  out = await run(BODY, { llm: "ok" });
+  crm.driver = () => "odoo";
+  check(out.body.mail === false,
+    "G: sin CRM configurado, mail:false → la pantalla no promete un correo que no sale");
+  // Un segundo diagnóstico del mismo negocio SÍ genera su propio correo: es un reporte nuevo, y
+  // saltárselo dejaría al prospecto sin nada si el primero falló (hallazgo de ship-review).
+  out = await run(BODY, { llm: "ok", attDeduped: true });
+  check(calls.some((c) => c.fn === "sendLeadEmail"),
+    "G: un adjunto dedupeado NO suprime el correo (cada diagnóstico nuevo se entrega)");
+
+  console.log("H — el correo falla: el diagnóstico igual llega a pantalla y el fallo se registra");
+  const logged = [];
+  console.error = (...a) => logged.push(a.join(" "));
+  out = await run(BODY, { llm: "ok", mail: "fail" });
+  console.error = realLog;
+  check(out.code === 200 && out.body.ok === true, "H: un fallo de correo NO rompe la respuesta al usuario");
+  check(calls.some((c) => c.fn === "attachToLead"), "H: el lead y el adjunto siguen guardados");
+  check(logged.some((l) => l.includes("correo al prospecto falló")),
+    "H: el fallo queda visible en los logs");
+  check(logged.some((l) => l.includes("MailDeliveryException")) && !logged.some((l) => l.includes("ana@ejemplo.com")),
+    "H: se loguea la CLASE del error, nunca el correo del prospecto (PII)");
+  // Los logs de Vercel no los mira nadie: el fallo tiene que llegar al canal que Gerónimo sí lee.
+  const alert = calls.filter((c) => c.fn === "telegram").find((c) => c.text.includes("No pude mandarle"));
+  check(!!alert, "H: además avisa por Telegram (si no, un correo caído volvería a ser invisible)");
+  check(alert && alert.text.includes("ana@ejemplo.com") && alert.text.includes("MailDeliveryException"),
+    "H: el aviso lleva a quién y por qué falló, para poder reenviarlo a mano");
+
+  console.log("I — el LLM falló: no hay diagnóstico que mandar, no se manda correo");
+  console.error = () => {};
+  out = await run(BODY, { llm: "fail" });
+  console.error = realLog;
+  check(!calls.some((c) => c.fn === "sendLeadEmail"),
+    "I: sin reporte no sale correo (nada peor que mandar un diagnóstico vacío)");
 
   console.log(`\n${pass} ok, ${fail} fail`);
   process.exit(fail ? 1 : 0);
