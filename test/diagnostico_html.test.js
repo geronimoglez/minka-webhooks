@@ -1,7 +1,7 @@
 // test/diagnostico_html.test.js — Tests del renderer del diagnóstico (node puro, sin deps).
 // Corre: `node test/diagnostico_html.test.js`. Exit 1 si falla algo.
 
-const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, activarUrl, firstName,
+const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, activarUrl, telegramUrl, firstName,
   PLAN_LABEL } = require("../lib/diagnostico_html");
 
 let pass = 0, fail = 0;
@@ -125,6 +125,55 @@ check(firstName("") === "" && firstName(null) === "", "firstName: vacío/null �
 check(firstName("A") === "", "firstName: una letra suelta no es un nombre");
 check(!renderDiagnosticoEmail({ nombre: "123", negocio: "X" }, report, {}).includes("Hola "),
   "correo: sin nombre usable, el saludo se omite (no queda 'Hola ,')");
+
+/* ---------------- Deep-link a Telegram — bridge privacy-safe hacia el bot ---------------- */
+
+// 11) telegramUrl — caso normal: negocio/giro válidos, plan conocido, horas redondeadas
+const tgUrl = telegramUrl({ negocio: "Minka Digital", giro: "Marketing" },
+  { horas_semana: 6, plan: { slug: "respuesta-ia" } });
+check(typeof tgUrl === "string" && tgUrl.startsWith("https://t.me/"), "telegramUrl: arma un link de Telegram");
+check(tgUrl.endsWith("?start=n-Minka-Digital_g-Marketing_p-R_h-6"),
+  "telegramUrl: payload con negocio/giro/plan/horas correctos");
+
+// 12) telegramUrl: mapea los 3 slugs de plan a su código de una letra
+check(telegramUrl({ negocio: "X" }, { plan: { slug: "funnel-esencial" } }).includes("_p-F_"),
+  "telegramUrl: funnel-esencial -> F");
+check(telegramUrl({ negocio: "X" }, { plan: { slug: "sistema-crecimiento" } }).includes("_p-S_"),
+  "telegramUrl: sistema-crecimiento -> S");
+
+// 13) telegramUrl: slug de plan desconocido -> sin link (nunca asumas el plan barato)
+check(telegramUrl({ negocio: "Minka" }, { plan: { slug: "plan-que-no-existe" } }) === null,
+  "telegramUrl: slug de plan desconocido no cae a un plan por default");
+check(telegramUrl({ negocio: "Minka" }, { plan: {} }) === null, "telegramUrl: sin plan.slug -> sin link");
+
+// 14) telegramUrl: negocio que sanea a vacío (solo emoji/puntuación) -> sin link (rompería el saludo del bot)
+check(telegramUrl({ negocio: "🎉🎉🎉" }, { plan: { slug: "respuesta-ia" } }) === null,
+  "telegramUrl: negocio vacío tras sanear no genera link");
+check(telegramUrl({ negocio: "" }, { plan: { slug: "respuesta-ia" } }) === null,
+  "telegramUrl: negocio ausente no genera link");
+
+// 15) telegramUrl: giro vacío es tolerable (solo negocio es obligatorio para el saludo)
+const tgSinGiro = telegramUrl({ negocio: "Minka Digital" }, { plan: { slug: "respuesta-ia" } });
+check(typeof tgSinGiro === "string" && tgSinGiro.includes("g-_p-R"),
+  "telegramUrl: sin giro, igual arma el link (segmento vacío)");
+
+// 16) telegramUrl: horas_semana ausente/no numérico -> horas=0 (no revienta, no cae a null)
+check(telegramUrl({ negocio: "Minka" }, { plan: { slug: "respuesta-ia" } }).endsWith("_h-0"),
+  "telegramUrl: sin horas_semana -> h-0");
+check(telegramUrl({ negocio: "Minka" }, { horas_semana: "seis", plan: { slug: "respuesta-ia" } }).endsWith("_h-0"),
+  "telegramUrl: horas_semana no numérico -> h-0");
+
+// 17) telegramUrl: acentos/ñ se sanean igual que slugify (sin romper el charset del payload)
+const tgAcentos = telegramUrl({ negocio: "Café Ñoño S.A.", giro: "Panadería" },
+  { plan: { slug: "respuesta-ia" } });
+check(/^https:\/\/t\.me\/[^?]+\?start=[A-Za-z0-9_-]{1,64}$/.test(tgAcentos),
+  "telegramUrl: negocio/giro con acentos producen un payload limpio [A-Za-z0-9_-]");
+
+// 18) telegramUrl: nunca lleva contacto (nombre/email/whatsapp) — el payload es público, viaja expuesto
+const tgConContacto = telegramUrl({ negocio: "Minka", email: "g@x.com", whatsapp: "3312345678" },
+  { plan: { slug: "respuesta-ia" } });
+check(!tgConContacto.includes("x.com") && !tgConContacto.includes("3312345678"),
+  "telegramUrl: nunca incluye email ni whatsapp en el payload");
 
 console.log(`\n${"=".repeat(46)}\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
