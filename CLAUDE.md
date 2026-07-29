@@ -3,22 +3,32 @@
 Endpoints serverless (Vercel) de Minka Digital: **diagnóstico P0**, **onboarding** y **portal**.
 CRM = **Odoo** (GHL purgado 2026-07-16; ver `README.md`). Node ≥18, sin build step.
 
-## ⚠️ Deploy — es MANUAL (no hay auto-deploy)
+## Deploy — es AUTOMÁTICO (GitHub → Vercel), reconectado 2026-07-29
 
-Este proyecto **NO tiene conectado el auto-deploy de GitHub → Vercel**. Un `git push` a
-`main` **NO despliega nada** a producción. El deploy es manual, con la CLI de Vercel:
+Un `git push` a `main` **sí despliega solo** a producción — verificado empíricamente el
+2026-07-29: el deployment `dpl_9zxrPgN2KfDj4whJ2xGTGWXQ1EuN` se creó a las 20:57:59 UTC, 9
+segundos después del push del commit `b900664` (`vercel inspect` confirmó que el alias de
+prod `minka-webhooks.vercel.app` apunta exactamente a ese deployment). El proyecto vive bajo
+el **team `minkadigital`** en Vercel (Gerónimo lo conectó/transfirió; Project Settings → Git
+muestra `geronimoglez/minka-webhooks` conectado).
+
+**Ya no hace falta `npm run deploy` en el flujo normal** — solo si necesitas forzar un deploy
+sin pasar por git (poco común):
 
 ```powershell
-npm run deploy   # = vercel --prod --yes --scope geronimoglezs-projects
+npm run deploy   # = vercel --prod --yes --scope minkadigital
 ```
 
 Prod alias: <https://minka-webhooks.vercel.app>
 
-> Contexto: el auto-deploy GitHub→Vercel se complicó una vez y se dejó desconectado a
-> propósito. Como este repo es de un solo proyecto, se podría reconectar directo si algún
-> día se quiere (pendiente, no urgente). Mientras tanto: **siempre `npm run deploy`**.
+Para verificar un deploy: `curl -s -o /dev/null -w "%{http_code}" https://minka-webhooks.vercel.app/api/onboarding` → `405` = vivo (POST-only). Para confirmar QUÉ commit está en prod: `vercel ls minka-webhooks` (lista deployments con edad) + `vercel inspect <url>` (fecha de creación, cotejar contra `git log`).
 
-Para verificar un deploy: `curl -s -o /dev/null -w "%{http_code}" https://minka-webhooks.vercel.app/api/onboarding` → `405` = vivo (POST-only).
+> Nota para agentes sin sesión de Vercel propia: el conector MCP de Vercel puede no ver este
+> proyecto aunque exista (token de cuenta con caché desalineada del lado del conector, no un
+> problema real de Vercel) — si `get_project`/`list_projects` no lo encuentra, no asumas que
+> no existe. Confirmar con `vercel login` (device-auth, requiere que Gerónimo apruebe una vez
+> en el navegador) + `vercel project ls` / `vercel ls minka-webhooks` antes de reportar un
+> bloqueo de acceso.
 
 ## Arquitectura en 30 segundos (salidas vs webhooks)
 
