@@ -2,7 +2,9 @@
 // Corre: `node test/diagnostico_flow.test.js`. Exit 1 si falla algo. Sin deps: stubea lib/crm y fetch.
 //
 // EL punto de todo el blindaje: el lead entra al CRM ANTES de depender del LLM.
-//  A: el LLM falla del todo → 502 al usuario, pero el lead SÍ se guardó y Telegram SÍ avisó.
+//  A: el LLM falla del todo → 503 al usuario, pero el lead SÍ se guardó y Telegram SÍ avisó.
+//     (503, no 502: dependencia de arriba caída ≠ gateway roto — el 502 se confundía con un error
+//      de plataforma de Vercel al depurar el incidente del 2026-07-30.)
 //  B: camino feliz → pushLead arranca ANTES del LLM y el enriquecimiento (nota + adjunto) va aparte.
 //  C: si el push pre-LLM falla, el enriquecimiento reintenta el lead COMPLETO (con nota).
 //  D: si el CRM falla del todo, el aviso de Telegram carga los datos del formulario (único registro).
@@ -17,6 +19,7 @@ process.env.DIAGNOSTICO_MODEL_FALLBACK = "modelo/fallback";
 process.env.TELEGRAM_BOT_TOKEN = "tg-token";
 process.env.TELEGRAM_CHAT_ID = "42";
 process.env.DIAGNOSTICO_BUDGET_MS = "500"; // presupuesto chico → el caso "Odoo lento" corre rápido
+process.env.DIAGNOSTICO_HARD_DEADLINE_MS = "3000"; // techo duro chico → el caso J corre en segundos
 
 // Stub de lib/crm ANTES de requerir el handler: diagnostico.js guarda la referencia al MÓDULO
 // (`const crm = require(...)`) y llama `crm.pushLead(...)` en runtime → mutar el objeto alcanza.
@@ -121,7 +124,7 @@ const realLog = console.error;
   console.error = realLog;
   const pushA = calls.find((c) => c.fn === "pushLead");
   const tgA = calls.find((c) => c.fn === "telegram");
-  check(out.code === 502, "A: el usuario recibe 502 (el diagnóstico no salió)");
+  check(out.code === 503, "A: el usuario recibe 503 (el diagnóstico no salió)");
   check(!!pushA, "A: pese al fallo del LLM, el lead SÍ se guardó en el CRM");
   check(pushA && pushA.tags.includes("diagnostico-p0"), "A: el lead lleva el tag `diagnostico-p0`");
   check(pushA && pushA.email === "ana@ejemplo.com", "A: el email va normalizado a minúsculas");
@@ -230,6 +233,23 @@ const realLog = console.error;
   console.error = realLog;
   check(!calls.some((c) => c.fn === "sendLeadEmail"),
     "I: sin reporte no sale correo (nada peor que mandar un diagnóstico vacío)");
+
+  // J — el caso que la ship-review del 2026-07-30 midió en 90 s reales (15 s por encima del
+  // maxDuration): LLM caído del todo Y Odoo lento pero vivo. Sin el techo duro (HARD_DEADLINE_MS),
+  // el `await` de la cola en `tail` esperaba a Odoo SIN cota y Vercel mataba la lambda antes de que
+  // saliera el 503 — el usuario volvía a ver un error de plataforma, justo lo que el fix evita.
+  // waitUntil() NO existe en este runner (no hay contexto de Vercel), así que se ejercita esa rama.
+  console.log("J — LLM caído + Odoo lento: la respuesta sale acotada, no cuelga hasta el maxDuration");
+  console.error = () => {};
+  const prevHard = process.env.DIAGNOSTICO_HARD_DEADLINE_MS;
+  const tJ = Date.now();
+  out = await run(BODY, { llm: "fail", delayMs: 30_000 });   // Odoo tardando 30 s
+  const elapsedJ = Date.now() - tJ;
+  console.error = realLog;
+  if (prevHard === undefined) delete process.env.DIAGNOSTICO_HARD_DEADLINE_MS;
+  check(out.code === 503, "J: responde 503 (no se cuelga esperando a Odoo)");
+  check(elapsedJ < 20_000,
+    `J: la respuesta sale acotada, no espera los 30 s de Odoo (tardó ${(elapsedJ / 1000).toFixed(1)} s)`);
 
   console.log(`\n${pass} ok, ${fail} fail`);
   process.exit(fail ? 1 : 0);

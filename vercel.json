@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/diagnostico.js": {
-      "maxDuration": 60
+      "maxDuration": 75
     },
     "api/onboarding.js": {
       "maxDuration": 15

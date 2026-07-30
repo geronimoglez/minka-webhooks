@@ -42,19 +42,45 @@ const MODEL = process.env.DIAGNOSTICO_MODEL || "xiaomi/mimo-v2.5-pro";
 // del tier capaz es deepseek-v4-pro). Un hipo de un solo modelo dejaba de generar diagnósticos.
 const MODEL_FALLBACK = process.env.DIAGNOSTICO_MODEL_FALLBACK || "deepseek/deepseek-v4-pro";
 // Presupuesto TOTAL del LLM (patrón de lib/crm.js): los reintentos nunca pueden exceder el
-// maxDuration de 60 s de vercel.json. 3 intentos × 18 s ≤ 45 s, quedan ~15 s de margen.
-const LLM_ATTEMPT_MS = 18_000;
-const LLM_BUDGET_MS = 45_000;
+// maxDuration de vercel.json (75 s).
+//
+// 2026-07-30 — incidente real (502 en producción, 3/3 AbortError): el timeout por intento eran
+// 18 s, pero la generación NORMAL tarda 15-17.5 s (tres mediciones contra prod: 15.3 / 17.5 / 15.5).
+// El intento más lento quedaba a medio segundo del corte: cualquier día lento abortaba los 3.
+// Ahora 24 s por intento = ~37% de margen sobre el peor caso medido (17.5 s). Se bajó de 30 a 24
+// tras la ship-review: 30 dejaba el peor caso del LLM en 60.8 s medidos y solo ~7 s de colchón
+// contra maxDuration; 24 lo deja en ~48.7 s, con colchón de sobra para cold start y jitter.
+//
+// Y son DOS intentos, no tres: reintentar el MISMO modelo que acaba de agotar 30 s casi nunca ayuda
+// (si está saturado, sigue saturado) y quemaba el presupuesto antes de llegar al fallback. El 2º
+// intento va directo al proveedor alterno, que es la falla que sí es independiente.
+const LLM_ATTEMPT_MS = 24_000;
+const LLM_BUDGET_MS = 50_000;
 const LLM_RETRY_BACKOFF_MS = 700;
-// Presupuesto del endpoint completo, por debajo del maxDuration 60 de vercel.json. Acota la espera
-// por el CRM: cada RPC de Odoo tiene su timeout (10 s en lib/crm.js) pero la CADENA no — un push
-// son ~8 RPCs. Si el LLM falla rápido y Odoo se arrastra, sin esta cota la lambda moriría a los 60 s
-// y el usuario vería un 504 de plataforma en vez de nuestro error.
+// Presupuesto de la parte SÍNCRONA del endpoint, por debajo del maxDuration 75 de vercel.json.
+// Acota la espera por el CRM: cada RPC de Odoo tiene su timeout (10 s en lib/crm.js) pero la CADENA
+// no — un push son ~8 RPCs. Si el LLM falla rápido y Odoo se arrastra, sin esta cota la lambda
+// moriría al llegar a maxDuration y el usuario vería un 504 de plataforma en vez de nuestro error.
+//
+// OJO (ship-review 2026-07-30): esta cota SOLO cubre el primer `await` del lead. El trabajo de cola
+// (`tail`/`side`) que se ejecuta con `await` cuando waitUntil() NO está disponible tiene su propia
+// cota — HARD_DEADLINE_MS de abajo. Sin ella se midieron 90 s reales (15 s por encima del
+// maxDuration) con el LLM caído y Odoo lento: el 503 "limpio" nunca llegaba a salir.
 // Overrideable por env para poder seguir a `maxDuration` si algún día cambia (y para los tests).
 const ENDPOINT_BUDGET_MS = (() => {
   const v = Number(process.env.DIAGNOSTICO_BUDGET_MS);
-  return Number.isFinite(v) ? Math.max(500, Math.min(58_000, v)) : 50_000;
+  return Number.isFinite(v) ? Math.max(500, Math.min(60_000, v)) : 56_000;
 })();
+
+// Techo DURO de toda la invocación, con margen contra el maxDuration 75 de vercel.json. Ninguna
+// rama del handler —ni la de cola cuando waitUntil() no existe— puede esperar más allá de esto: si
+// se pasa, Vercel mata la lambda y el usuario ve un error de plataforma en vez de nuestra respuesta.
+const HARD_DEADLINE_MS = (() => {
+  const v = Number(process.env.DIAGNOSTICO_HARD_DEADLINE_MS);
+  return Number.isFinite(v) ? Math.max(1000, Math.min(72_000, v)) : 68_000;
+})();
+// Lo que queda del techo duro desde que entró la petición (nunca negativo).
+const budgetLeft = (startedAt) => Math.max(0, HARD_DEADLINE_MS - (Date.now() - startedAt));
 
 // Resuelve con el valor de `promise` si llega dentro de `ms`; con `null` si sigue PENDIENTE.
 // Ojo: no cancela nada — la promesa sigue viva y el caller la recoge después en segundo plano.
@@ -238,7 +264,7 @@ async function callLLMOnce(user, model, timeoutMs) {
 async function callLLM(payload) {
   const user = userPrompt(payload);
   const deadline = Date.now() + LLM_BUDGET_MS;
-  const attempts = [MODEL, MODEL, MODEL_FALLBACK];
+  const attempts = [MODEL, MODEL_FALLBACK];
   for (let i = 0; i < attempts.length; i++) {
     const remaining = deadline - Date.now();
     if (remaining <= 1000) break; // sin presupuesto útil → degradar limpio (el lead ya está salvo)
@@ -372,11 +398,16 @@ const handler = async (req, res) => {
       // nunca otro) para que el "🔴 el CRM tampoco lo guardó" refleje el resultado real y no una
       // suposición: cuando el LLM falla, ese mensaje puede ser el único registro del prospecto.
       const tail = (async () => {
-        const settled = crmPending ? await leadPromise : led;
+        // Acotado: si Odoo se arrastra, se avisa por Telegram con lo que se sepa en vez de colgar la
+        // respuesta. `settled === null` = seguía en vuelo, que NO es lo mismo que haber fallado.
+        const settled = crmPending ? await settleWithin(leadPromise, budgetLeft(startedAt)) : led;
         await pingTelegram(p, null, { crmOk: !!(settled && settled.ok && settled.id) });
       })();
-      if (!waitUntil(tail)) await tail;
-      return res.status(502).json({ error: "No pude generar tu diagnóstico — inténtalo de nuevo." });
+      // Sin waitUntil, esperar la cola es lo único que retrasa la respuesta → doble cota.
+      if (!waitUntil(tail)) await settleWithin(tail, budgetLeft(startedAt));
+      // 503, no 502: es una dependencia de arriba (el LLM) temporalmente caída, no un gateway roto.
+      // El 502 se confundía con un error de plataforma de Vercel al depurar (pasó el 2026-07-30).
+      return res.status(503).json({ error: "No pude generar tu diagnóstico — inténtalo de nuevo en un minuto." });
     }
 
     const note = [
@@ -404,7 +435,9 @@ const handler = async (req, res) => {
     const enrich = (async () => {
       // Si el push seguía pendiente, aquí se recoge EL MISMO (nunca se lanza otro: dos pushes
       // concurrentes con un email nuevo podrían crear partner/lead duplicados en Odoo).
-      let finalLed = crmPending ? await leadPromise : led;
+      // Misma cota que en `tail`: sin ella, un Odoo lento aquí puede pasarse del maxDuration
+      // cuando waitUntil() no está disponible (ship-review 2026-07-30).
+      let finalLed = crmPending ? await settleWithin(leadPromise, budgetLeft(startedAt)) : led;
       let leadId = finalLed && finalLed.ok && finalLed.id ? finalLed.id : null;
       // Si el push pre-LLM falló (Odoo dormido, hipo de red), se reintenta aquí el lead COMPLETO
       // con la nota: es la última oportunidad de que el prospecto quede en el CRM.
@@ -474,7 +507,7 @@ const handler = async (req, res) => {
     // Si el runtime expone el contexto, la lambda sigue viva para `side` y el usuario NO espera a
     // Odoo. Si no, degradamos al `await side` de siempre: más lento, pero nunca se pierde el
     // enriquecimiento. En ambos casos el lead ya está guardado desde antes del LLM.
-    if (!waitUntil(side)) await side;
+    if (!waitUntil(side)) await settleWithin(side, budgetLeft(startedAt));
 
     // `mail` le dice al front si el diagnóstico VA a salir por correo, para que la pantalla no
     // prometa un envío que no va a ocurrir (driver "none", ODOO_* sin configurar, o kill-switch
@@ -492,4 +525,5 @@ const handler = async (req, res) => {
 module.exports = handler;
 // Internos expuestos SÓLO para test/diagnostico_llm.test.js (misma convención que lib/crm.js).
 // Vercel toma `module.exports` como handler; colgarle propiedades a la función no lo altera.
-module.exports.__test = { callLLM, normalizeReport, rateLimited, waitUntil, settleWithin, RL_MAX };
+module.exports.__test = { callLLM, normalizeReport, rateLimited, waitUntil, settleWithin, budgetLeft,
+  RL_MAX, HARD_DEADLINE_MS };

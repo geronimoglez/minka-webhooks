@@ -2,8 +2,10 @@
 // Corre: `node test/diagnostico_llm.test.js`. Exit 1 si falla algo. Sin deps: mockea global.fetch.
 //
 // Cubre:
-//  A: callLLM reintenta con el modelo primario ante un 5xx transitorio de OpenRouter.
-//  B: si el primario falla 2 veces, la 3ª pasada usa el modelo de FALLBACK (otro proveedor).
+//  A: ante un 5xx transitorio, el 2º (y último) intento va al modelo de FALLBACK, no al primario.
+//     Cambió el 2026-07-30: antes eran 3 intentos [primario, primario, fallback]; repetir el modelo
+//     que acaba de agotar 30 s casi nunca ayuda y quemaba el presupuesto antes de llegar al fallback.
+//  B: el fallback rescata el diagnóstico cuando el primario falla.
 //  C: un JSON malformado / reporte incompleto también dispara reintento (antes cortaba con 502).
 //  D: callLLM nunca lanza: agotados los intentos devuelve null (el lead ya está salvo).
 //  E: normalizeReport blinda al front — `cuellos`/`quickwins` SIEMPRE array, aunque el LLM los omita.
@@ -60,32 +62,31 @@ const realLog = console.error;
   console.log("A/B/C/D — callLLM: retry + fallback de modelo");
   console.error = () => {}; // silenciar los console.error esperados de los intentos fallidos
 
-  // A: 500 transitorio → reintenta con el MISMO modelo primario y devuelve el reporte.
+  // A: 500 transitorio → el reintento va al FALLBACK (otro proveedor), no al primario otra vez.
   let m = mockFetch([{ status: 500 }, { content: JSON.stringify(OK_REPORT) }]);
   let r = await callLLM(P);
   check(r && r.plan.slug === "respuesta-ia", "A: 500 transitorio → reintento exitoso");
-  check(m.models.length === 2 && m.models[0] === "modelo/primario" && m.models[1] === "modelo/primario",
-    "A: el reintento usa el modelo primario (" + m.models.join(", ") + ")");
+  check(m.models.length === 2 && m.models[0] === "modelo/primario" && m.models[1] === "modelo/fallback",
+    "A: el reintento cambia de proveedor (" + m.models.join(", ") + ")");
 
-  // B: primario falla 2 veces → 3ª pasada con el fallback.
-  m = mockFetch([{ status: 429 }, { status: 500 }, { content: JSON.stringify(OK_REPORT) }]);
+  // B: el fallback es quien rescata el diagnóstico.
+  m = mockFetch([{ status: 429 }, { content: JSON.stringify(OK_REPORT) }]);
   r = await callLLM(P);
   check(!!r, "B: el fallback rescata el diagnóstico");
-  check(m.models.length === 3 && m.models[2] === "modelo/fallback",
-    "B: la 3ª pasada usa el modelo de fallback (" + m.models.join(", ") + ")");
+  check(m.models.length === 2 && m.models[1] === "modelo/fallback",
+    "B: el 2º intento usa el modelo de fallback (" + m.models.join(", ") + ")");
 
-  // C: JSON malformado y reporte sin `plan` → reintentables (antes: 502 seco).
-  m = mockFetch([{ content: "{ esto no es json" }, { content: JSON.stringify({ resumen: "sin plan" }) },
-    { content: JSON.stringify(OK_REPORT) }]);
+  // C: JSON malformado → reintentable igual que un 5xx (antes: 502 seco).
+  m = mockFetch([{ content: "{ esto no es json" }, { content: JSON.stringify(OK_REPORT) }]);
   r = await callLLM(P);
-  check(!!r && r.plan.slug === "respuesta-ia", "C: JSON roto + reporte incompleto → reintenta y se recupera");
-  check(m.models.length === 3, "C: consumió los 3 intentos");
+  check(!!r && r.plan.slug === "respuesta-ia", "C: JSON roto → reintenta y se recupera");
+  check(m.models.length === 2, "C: consumió los 2 intentos");
 
-  // D: todo falla → null, sin lanzar (el handler responde 502 pero el lead ya está guardado).
+  // D: todo falla → null, sin lanzar (el handler responde 503 pero el lead ya está guardado).
   m = mockFetch([{ status: 503 }]);
   r = await callLLM(P);
   check(r === null, "D: agotados los intentos devuelve null (no lanza)");
-  check(m.models.length === 3, "D: intentó las 3 veces antes de rendirse");
+  check(m.models.length === 2, "D: intentó las 2 veces antes de rendirse");
 
   console.error = realLog;
   global.fetch = realFetch;
@@ -139,7 +140,7 @@ const realLog = console.error;
   console.error = realLog;
   global.fetch = realFetch;
   check(r === null, "H: el JSON roto agota los intentos y devuelve null");
-  check(logged.length === 3, "H: se logueó un intento fallido por pasada");
+  check(logged.length === 2, "H: se logueó un intento fallido por pasada");
   const blob = logged.join(" | ");
   check(!blob.includes("Taqueria") && !blob.includes("Chuy") && !blob.includes("3312345678"),
     "H: NINGÚN dato del prospecto aparece en los logs");
