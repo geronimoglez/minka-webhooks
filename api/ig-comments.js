@@ -31,7 +31,11 @@ module.exports = async (req, res) => {
   // 1) Handshake de verificación de Meta
   if (req.method === "GET") {
     const q = req.query || {};
-    if (q["hub.mode"] === "subscribe" && q["hub.verify_token"] === ig.VERIFY_TOKEN) {
+    // FAIL-CLOSED: sin IG_VERIFY_TOKEN configurado se rechaza SIEMPRE. Si no, un token vacío
+    // coincide con la variable vacía y cualquiera completa el handshake.
+    if (ig.VERIFY_TOKEN &&
+        q["hub.mode"] === "subscribe" &&
+        q["hub.verify_token"] === ig.VERIFY_TOKEN) {
       return res.status(200).send(q["hub.challenge"]);
     }
     return res.status(403).send("forbidden");

@@ -95,3 +95,12 @@ prueba("sin OPENROUTER_API_KEY el análisis cae a manual y no inventa borrador",
 setTimeout(() => {
   console.log(`\n${pasados} pruebas ok${process.exitCode ? " — CON FALLAS" : ""}\n`);
 }, 50);
+
+// ─── Fail-closed del handshake de Meta ────────────────────────────────────
+// Sin IG_VERIFY_TOKEN, un `hub.verify_token=` vacío coincidía con la variable vacía y
+// cualquiera completaba el handshake. Detectado en el deploy real.
+console.log("\nFail-closed del handshake");
+const src = require("fs").readFileSync(require("path").join(__dirname, "../api/ig-comments.js"), "utf8");
+prueba("el handshake exige que IG_VERIFY_TOKEN exista", () =>
+  assert.ok(/if \(ig\.VERIFY_TOKEN &&/.test(src),
+    "la condición debe empezar exigiendo VERIFY_TOKEN no vacío"));
