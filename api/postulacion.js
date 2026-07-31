@@ -16,7 +16,7 @@
 const crm = require("../lib/crm");
 const sign = require("../lib/sign");
 const { config } = require("../lib/evento");
-const { formPage, FIELDS } = require("../lib/postulacion_html");
+const { formPage, FIELDS, setSecurityHeaders } = require("../lib/postulacion_html");
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
@@ -86,7 +86,7 @@ function readValues(b) {
 module.exports = async (req, res) => {
   const cfg = config();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("X-Content-Type-Options", "nosniff");
+  setSecurityHeaders(res);
   res.setHeader("Referrer-Policy", "same-origin");
 
   if (req.method === "GET" || req.method === "HEAD") {

@@ -9,12 +9,12 @@
 
 const sign = require("../lib/sign");
 const { config } = require("../lib/evento");
-const { graciasPage } = require("../lib/postulacion_html");
+const { graciasPage, setSecurityHeaders } = require("../lib/postulacion_html");
 
 module.exports = async (req, res) => {
   const cfg = config();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("X-Content-Type-Options", "nosniff");
+  setSecurityHeaders(res);
   // La página está ligada a una postulación concreta → jamás en un cache compartido. Y sin Referer
   // hacia afuera, para que el token no viaje a Stripe ni a ningún tercero.
   res.setHeader("Cache-Control", "no-store, private");

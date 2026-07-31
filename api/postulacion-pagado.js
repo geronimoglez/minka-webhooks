@@ -12,10 +12,11 @@ const sign = require("../lib/sign");
 const stripe = require("../lib/stripe");
 const { confirm } = require("../lib/apartado");
 const { config } = require("../lib/evento");
-const { avisoPage } = require("../lib/postulacion_html");
+const { avisoPage, setSecurityHeaders } = require("../lib/postulacion_html");
 
 module.exports = async (req, res) => {
   const cfg = config();
+  setSecurityHeaders(res);
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Referrer-Policy", "no-referrer");
 
