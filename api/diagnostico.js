@@ -6,7 +6,7 @@
 // Guardrails: caps de input, honeypot, rate-limit best-effort, timeout LLM, anti prompt-injection.
 
 const crm = require("../lib/crm"); // adaptador Odoo/none (GHL purgado 2026-07-16)
-const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, telegramUrl } = require("../lib/diagnostico_html");
+const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, telegramUrl, desestilizar } = require("../lib/diagnostico_html");
 
 // waitUntil real de Vercel: mantiene viva la lambda para el trabajo en segundo plano DESPUÉS de
 // responder. `res.waitUntil` NO existe con la firma (req,res) del runtime Node — el código anterior
@@ -122,7 +122,13 @@ function rateLimited(ip) {
   return rec.length > RL_MAX;
 }
 
-const clip = (s, n) => String(s ?? "").slice(0, n).trim();
+// TODO input de usuario pasa por aquí. Además de acotar, DESESTILIZA: los dueños de negocio pegan
+// su marca con "tipografías" de Instagram (versalitas ᴘᴜɴᴛᴏ ᴄʀᴇᴍᴀ, negritas 𝐌𝐢𝐧𝐤𝐚, anchas ＭＩＮＫＡ)
+// que no son fuentes sino caracteres Unicode distintos. Sin esto entran tal cual al CRM y el lead
+// deja de ser buscable ("Punto Crema" no encuentra "ᴘᴜɴᴛᴏ ᴄʀᴇᴍᴀ"), el LLM razona sobre símbolos
+// raros, y el deep-link se cae. Los acentos del español NO se tocan: Café sigue siendo Café.
+// Real: pasó el 2026-07-30 con un lead de prueba.
+const clip = (s, n) => desestilizar(s).slice(0, n).trim();
 
 // ── Correo del diagnóstico al prospecto (FASE 2) ────────────────────────────────────────────────
 // Copy y remitente viven en constantes A PROPÓSITO: son decisiones de negocio de Gerónimo, no de

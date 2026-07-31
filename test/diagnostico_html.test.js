@@ -1,8 +1,8 @@
 // test/diagnostico_html.test.js — Tests del renderer del diagnóstico (node puro, sin deps).
 // Corre: `node test/diagnostico_html.test.js`. Exit 1 si falla algo.
 
-const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, activarUrl, telegramUrl, firstName,
-  PLAN_LABEL } = require("../lib/diagnostico_html");
+const { renderDiagnosticoHTML, renderDiagnosticoEmail, slugify, activarUrl, telegramUrl, desestilizar,
+  firstName, PLAN_LABEL } = require("../lib/diagnostico_html");
 
 let pass = 0, fail = 0;
 function check(cond, label) {
@@ -168,6 +168,32 @@ const tgAcentos = telegramUrl({ negocio: "Café Ñoño S.A.", giro: "Panadería"
   { plan: { slug: "respuesta-ia" } });
 check(/^https:\/\/t\.me\/[^?]+\?start=[A-Za-z0-9_-]{1,64}$/.test(tgAcentos),
   "telegramUrl: negocio/giro con acentos producen un payload limpio [A-Za-z0-9_-]");
+
+// 17b) telegramUrl: "tipografías" de Instagram (Unicode) — un dueño que escribe su marca con
+// versalitas o negritas SÍ debe recibir el enlace. El 2026-07-30 no salía el botón con
+// "ᴘᴜɴᴛᴏ ᴄʀᴇᴍᴀ ʀᴇꜱᴛᴀᴜʀᴀɴᴛᴇ" — el saneo borraba cada caracter y el negocio quedaba vacío.
+const tgVersalitas = telegramUrl({ negocio: "ᴘᴜɴᴛᴏ ᴄʀᴇᴍᴀ ʀᴇꜱᴛᴀᴜʀᴀɴᴛᴇ" }, { plan: { slug: "respuesta-ia" } });
+check(typeof tgVersalitas === "string" && tgVersalitas.includes("n-punto-crema"),
+  "telegramUrl: versalitas Unicode se traducen a ASCII (no se pierde el enlace)");
+check(/^https:\/\/t\.me\/[^?]+\?start=[A-Za-z0-9_-]{1,64}$/.test(tgVersalitas),
+  "telegramUrl: el payload de versalitas queda limpio [A-Za-z0-9_-]");
+const tgNegritas = telegramUrl({ negocio: "\u{1D40C}\u{1D422}\u{1D427}\u{1D424}\u{1D41A}" }, { plan: { slug: "respuesta-ia" } });
+check(typeof tgNegritas === "string" && tgNegritas.includes("n-Minka"),
+  "telegramUrl: negritas Unicode se normalizan con NFKD");
+const tgAnchas = telegramUrl({ negocio: "\uFF2D\uFF29\uFF2E\uFF2B\uFF21" }, { plan: { slug: "respuesta-ia" } });
+check(typeof tgAnchas === "string" && tgAnchas.includes("n-MINKA"),
+  "telegramUrl: caracteres de ancho completo se normalizan");
+
+// 17c) desestilizar — se aplica en la ENTRADA del endpoint, así que protege CRM, correo, prompt del
+// LLM y deep-link de una sola vez. Lo crítico: quita el formato falso SIN tocar acentos legítimos.
+check(desestilizar("ᴘᴜɴᴛᴏ ᴄʀᴇᴍᴀ ʀᴇꜱᴛᴀᴜʀᴀɴᴛᴇ") === "punto crema restaurante",
+  "desestilizar: versalitas → texto normal (el lead queda buscable en el CRM)");
+check(desestilizar("\u{1D40C}\u{1D422}\u{1D427}\u{1D424}\u{1D41A}") === "Minka", "desestilizar: negritas Unicode");
+check(desestilizar("\uFF2D\uFF29\uFF2E\uFF2B\uFF21") === "MINKA", "desestilizar: ancho completo");
+check(desestilizar("Café Ñoño S.A.") === "Café Ñoño S.A.",
+  "desestilizar: NO toca los acentos del español (Café sigue siendo Café)");
+check(desestilizar("Panadería La Espiga") === "Panadería La Espiga", "desestilizar: texto normal intacto");
+check(desestilizar(null) === "" && desestilizar(undefined) === "", "desestilizar: null/undefined → cadena vacía");
 
 // 18) telegramUrl: nunca lleva contacto (nombre/email/whatsapp) — el payload es público, viaja expuesto
 const tgConContacto = telegramUrl({ negocio: "Minka", email: "g@x.com", whatsapp: "3312345678" },
