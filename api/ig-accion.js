@@ -27,8 +27,10 @@ function comentarioDe(texto) {
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "method not allowed" });
-  if (SECRET && req.headers["x-telegram-bot-api-secret-token"] !== SECRET) {
-    return res.status(401).json({ error: "secret inválido" });
+  // FAIL-CLOSED (regla del repo): si el secreto no está configurado se RECHAZA, nunca se
+  // salta la verificación. Este endpoint publica en Instagram con la cara de la marca.
+  if (!SECRET || req.headers["x-telegram-bot-api-secret-token"] !== SECRET) {
+    return res.status(401).json({ error: "secret inválido o sin configurar" });
   }
 
   const upd = req.body || {};
