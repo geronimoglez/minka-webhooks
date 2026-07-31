@@ -6,7 +6,7 @@
 // docs/instagram-moderacion-copiloto.md §MODO AUDIENCIA.
 //
 // Configuración en la app `minka-assistant` de Meta (Instagram → Configurar webhooks):
-//   URL de callback: https://<deploy>/api/ig-comments
+//   URL de callback: https://minka-webhooks.vercel.app/api/ig-comments
 //   Token de verificación: el valor de IG_VERIFY_TOKEN
 //   Campo suscrito: `comments`
 // La cuenta debe tener la suscripción ACTIVADA (el toggle de la tabla de cuentas).
@@ -25,17 +25,6 @@ function leerCrudo(req) {
     req.on("end", () => resolve(Buffer.concat(partes)));
     req.on("error", reject);
   });
-}
-
-// Descarta reentregas de Meta (reintenta ante cualquier no-2xx). Sin esto, un timeout
-// puntual haría que el mismo comentario se responda dos veces.
-const vistos = new Map();
-function yaProcesado(id) {
-  const ahora = Date.now();
-  for (const [k, t] of vistos) if (ahora - t > 3_600_000) vistos.delete(k);
-  if (vistos.has(id)) return true;
-  vistos.set(id, ahora);
-  return false;
 }
 
 module.exports = async (req, res) => {
@@ -83,7 +72,7 @@ async function procesar(payload) {
       if (ch.field !== "comments") continue;
       const v = ch.value || {};
       const commentId = v.id;
-      if (!commentId || yaProcesado(commentId)) continue;
+      if (!commentId) continue;
 
       // Nunca reaccionar a los comentarios de la propia cuenta: nos responderíamos solos.
       const autorId = v.from?.id;
@@ -91,6 +80,10 @@ async function procesar(payload) {
 
       const texto = v.text || "";
       if (!texto.trim()) continue;
+
+      // Deduplicación contra el hilo real, no contra memoria local: en serverless no hay
+      // estado que sobreviva a un arranque en frío, y Meta reintenta el webhook.
+      if (cuenta?.username && (await ig.yaRespondido(commentId, cuenta.username))) continue;
 
       let contexto = "";
       try {

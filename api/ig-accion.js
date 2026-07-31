@@ -1,7 +1,7 @@
 // Webhook de Telegram: ejecuta el tap de Gerónimo sobre una propuesta del copiloto.
 //
 // Registrar una sola vez (el secret_token evita que cualquiera POSTee acá):
-//   curl -F "url=https://<deploy>/api/ig-accion" \
+//   curl -F "url=https://minka-webhooks.vercel.app/api/ig-accion" \
 //        -F "secret_token=$TELEGRAM_WEBHOOK_SECRET" \
 //        -F "allowed_updates=[\"callback_query\",\"message\"]" \
 //        "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook"
