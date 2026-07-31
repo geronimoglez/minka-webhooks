@@ -9,6 +9,12 @@
     },
     "api/portal-status.js": {
       "maxDuration": 10
+    },
+    "api/ig-comments.js": {
+      "maxDuration": 30
+    },
+    "api/ig-accion.js": {
+      "maxDuration": 15
     }
   }
 }
