@@ -5,7 +5,8 @@
   "description": "Endpoints serverless de Minka Digital (diagnóstico P0, onboarding, portal) — CRM Odoo",
   "scripts": {
     "dev": "vercel dev",
-    "deploy": "vercel --prod --yes --scope minkadigital"
+    "test": "for f in test/*.test.js; do node \"$f\" || exit 1; done",
+    "deploy": "npm test && vercel --prod --yes --scope minkadigital"
   },
   "engines": {
     "node": ">=18.0.0"

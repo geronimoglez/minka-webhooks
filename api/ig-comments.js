@@ -14,6 +14,7 @@
 const ig = require("../lib/ig");
 const copiloto = require("../lib/copiloto");
 const tg = require("../lib/telegram");
+const { agendar } = require("../lib/despues");
 
 // Vercel parsea el body y perdemos el crudo, que es lo que Meta firma. Se lee el stream.
 module.exports.config = { api: { bodyParser: false } };
@@ -55,16 +56,18 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: "body no es JSON" });
   }
 
-  // Se responde 200 YA: Meta reintenta ante cualquier demora o error, y un reintento
-  // significa procesar el mismo comentario otra vez.
-  res.status(200).json({ ok: true });
-
-  try {
-    await procesar(payload);
-  } catch (e) {
+  const trabajo = procesar(payload).catch(async (e) => {
     console.error("ig-comments: fallo procesando", e);
-    await tg.aviso(`⚠️ Copiloto IG: fallo procesando un comentario — ${e.message}`);
-  }
+    await tg.aviso(`⚠️ Copiloto IG: fallo procesando un comentario — ${e.message}`).catch(() => {});
+  });
+
+  // Meta reintenta ante demora, así que lo ideal es contestar 200 YA. Pero contestar TERMINA
+  // la invocación en serverless y el trabajo pendiente se congela sin dejar rastro (así se
+  // perdieron los primeros updates). Si la plataforma no se hace cargo, se espera y se
+  // contesta después: un reintento de Meta es tolerable —el dedup contra el hilo real lo
+  // absorbe—, perder el comentario en silencio no.
+  if (!agendar(trabajo)) await trabajo;
+  return res.status(200).json({ ok: true });
 };
 
 async function procesar(payload) {

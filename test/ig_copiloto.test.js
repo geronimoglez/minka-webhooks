@@ -7,15 +7,23 @@ const assert = require("assert");
 const crypto = require("crypto");
 
 let pasados = 0;
+const resultado = (nombre) => [
+  () => { pasados++; console.log(`  ok  ${nombre}`); },
+  (e) => { console.error(`  FALLA  ${nombre}\n        ${e.message}`); process.exitCode = 1; },
+];
+
 function prueba(nombre, fn) {
-  try {
-    fn();
-    pasados++;
-    console.log(`  ok  ${nombre}`);
-  } catch (e) {
-    console.error(`  FALLA  ${nombre}\n        ${e.message}`);
-    process.exitCode = 1;
-  }
+  const [ok, falla] = resultado(nombre);
+  try { fn(); ok(); } catch (e) { falla(e); }
+}
+
+// Las pruebas async se ENCOLAN, no se disparan al vuelo: varias corriendo a la vez se pisan
+// el stub de global.fetch entre ellas y el resultado depende de quién termine primero.
+// (Y si no se esperan, una prueba async "pasa" siempre aunque reviente.)
+let cola = Promise.resolve();
+function pruebaAsync(nombre, fn) {
+  const [ok, falla] = resultado(nombre);
+  cola = cola.then(fn).then(ok, falla);
 }
 
 // ─── Firma del webhook ────────────────────────────────────────────────────
@@ -83,7 +91,7 @@ prueba("rechaza cuando TELEGRAM_WEBHOOK_SECRET no está configurado", () =>
 
 // ─── Análisis degrada a manual si falla el LLM ────────────────────────────
 console.log("\nDegradación del clasificador");
-prueba("sin OPENROUTER_API_KEY el análisis cae a manual y no inventa borrador", async () => {
+pruebaAsync("sin OPENROUTER_API_KEY el análisis cae a manual y no inventa borrador", async () => {
   const guardado = process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   const r = await copiloto.analizar("hola", "");
@@ -91,10 +99,6 @@ prueba("sin OPENROUTER_API_KEY el análisis cae a manual y no inventa borrador",
   assert.strictEqual(r.arquetipo, "lead");
   assert.strictEqual(r.borrador, null);
 });
-
-setTimeout(() => {
-  console.log(`\n${pasados} pruebas ok${process.exitCode ? " — CON FALLAS" : ""}\n`);
-}, 50);
 
 // ─── Fail-closed del handshake de Meta ────────────────────────────────────
 // Sin IG_VERIFY_TOKEN, un `hub.verify_token=` vacío coincidía con la variable vacía y
@@ -104,3 +108,80 @@ const src = require("fs").readFileSync(require("path").join(__dirname, "../api/i
 prueba("el handshake exige que IG_VERIFY_TOKEN exista", () =>
   assert.ok(/if \(ig\.VERIFY_TOKEN &&/.test(src),
     "la condición debe empezar exigiendo VERIFY_TOKEN no vacío"));
+
+// ─── El trabajo ocurre ANTES de responder ─────────────────────────────────
+// Bug real (2026-07-31): los endpoints contestaban 200 y "después" trabajaban. En serverless
+// contestar TERMINA la invocación: lo pendiente se congela sin log, sin error y sin rastro. El
+// webhook devolvía 200 impecable y no pasaba absolutamente nada. Estos tests lo fijan.
+console.log("\nEl trabajo ocurre ANTES de contestar (el bug del agujero negro)");
+
+process.env.TELEGRAM_WEBHOOK_SECRET = "secreto-tg";
+process.env.COPILOTO_BOT_TOKEN = "bot-de-prueba";
+process.env.TELEGRAM_CHAT_ID = "42";
+const accion = require("../api/ig-accion");
+
+function resFalso(orden) {
+  return {
+    status(c) { orden.push(`status:${c}`); return this; },
+    json() { orden.push("json"); return this; },
+  };
+}
+
+pruebaAsync("/prueba manda la propuesta a Telegram antes del 200", async () => {
+  const orden = [];
+  const original = global.fetch;
+  global.fetch = async (url) => {
+    orden.push(`telegram:${String(url).split("/").pop()}`);
+    return { ok: true, json: async () => ({ ok: true }), text: async () => "" };
+  };
+  try {
+    await accion(
+      { method: "POST", headers: { "x-telegram-bot-api-secret-token": "secreto-tg" },
+        body: { message: { chat: { id: 7 }, text: "/prueba" } } },
+      resFalso(orden)
+    );
+  } finally {
+    global.fetch = original;
+  }
+  const primer200 = orden.indexOf("status:200");
+  const envios = orden.filter((o) => o.startsWith("telegram:")).length;
+  assert.strictEqual(envios, 2, `esperaba ayuda + propuesta, hubo ${envios}: ${orden.join(" → ")}`);
+  assert.ok(primer200 > 0 && orden.slice(0, primer200).every((o) => o.startsWith("telegram:")),
+    `el 200 salió antes del trabajo: ${orden.join(" → ")}`);
+});
+
+pruebaAsync("el botón de PRUEBA no toca Instagram", async () => {
+  const urls = [];
+  const original = global.fetch;
+  global.fetch = async (url) => {
+    urls.push(String(url));
+    return { ok: true, json: async () => ({ ok: true }), text: async () => "" };
+  };
+  try {
+    await accion(
+      { method: "POST", headers: { "x-telegram-bot-api-secret-token": "secreto-tg" },
+        body: { callback_query: { id: "cb1", data: "send:PRUEBA", from: { username: "gero" },
+          message: { message_id: 9, chat: { id: 7 }, text: "✍️ Borrador:\nhola" } } } },
+      resFalso([])
+    );
+  } finally {
+    global.fetch = original;
+  }
+  assert.ok(urls.every((u) => u.includes("api.telegram.org")),
+    `la prueba llamó a Instagram: ${urls.join(", ")}`);
+});
+
+prueba("ningún endpoint contesta antes de agendar el trabajo", () => {
+  const fs = require("fs"), path = require("path");
+  for (const f of ["ig-accion.js", "ig-comments.js"]) {
+    const t = fs.readFileSync(path.join(__dirname, "../api", f), "utf8");
+    assert.ok(/if \(!agendar\(trabajo\)\) await trabajo;/.test(t),
+      `${f}: el trabajo debe esperarse cuando la plataforma no se hace cargo`);
+    assert.ok(!/res\.status\(200\)[^\n]*\n\n?\s*try \{/.test(t),
+      `${f}: volvió el patrón "contesta 200 y después procesa" — en serverless eso no corre`);
+  }
+});
+
+cola.then(() => {
+  console.log(`\n${pasados} pruebas ok${process.exitCode ? " — CON FALLAS" : ""}\n`);
+});

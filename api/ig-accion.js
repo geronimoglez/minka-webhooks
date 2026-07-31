@@ -4,13 +4,14 @@
 //   curl -F "url=https://minka-webhooks.vercel.app/api/ig-accion" \
 //        -F "secret_token=$TELEGRAM_WEBHOOK_SECRET" \
 //        -F "allowed_updates=[\"callback_query\",\"message\"]" \
-//        "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook"
+//        "https://api.telegram.org/bot$COPILOTO_BOT_TOKEN/setWebhook"
 //
 // Para EDITAR un borrador antes de mandarlo: responder (reply) al mensaje de la propuesta con
 // el texto corregido. Se publica ese texto en vez del borrador.
 
 const ig = require("../lib/ig");
 const tg = require("../lib/telegram");
+const { agendar } = require("../lib/despues");
 
 const SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 
@@ -34,91 +35,114 @@ module.exports = async (req, res) => {
   }
 
   const upd = req.body || {};
-  res.status(200).json({ ok: true }); // Telegram reintenta ante demora: se contesta ya
+  console.log("ig-accion:", upd.callback_query ? `botón ${upd.callback_query.data}`
+    : upd.message ? `mensaje «${String(upd.message.text || "").slice(0, 40)}»` : "update ignorado");
 
-  try {
-    // A0) Mensaje suelto (no es respuesta a una propuesta). Sin esto el bot es un agujero
-    // negro: escribes y no contesta nada, que parece que está roto. Además devuelve el
-    // chat_id, que es justo el dato que hace falta para configurarlo.
-    if (upd.message && !upd.message.reply_to_message) {
-        const m = upd.message;
-        const texto = (m.text || "").trim();
-        const ayuda =
-          "🤖 <b>Copiloto de comentarios</b> — estoy vivo.\n\n" +
-          "No soy conversacional: solo te aviso cuando alguien comenta en Instagram y te " +
-          "mando el borrador con botones.\n\n" +
-          "• <b>Enviar</b> publica el borrador tal cual\n" +
-          "• <b>Ocultar</b> esconde el comentario (no lo borra)\n" +
-          "• Para corregir: <b>responde</b> a mi mensaje con tu texto y publico el tuyo\n\n" +
-          `Tu <code>chat_id</code> es <code>${m.chat.id}</code>`;
-        await tg.llamar("sendMessage", {
-          chat_id: m.chat.id, text: ayuda, parse_mode: "HTML",
-        });
-        if (texto === "/prueba") {
-          await tg.propuesta({
-            commentId: "PRUEBA", autor: "un_prospecto",
-            texto: "¿Y esto sirve para una taquería o solo para negocios grandes?",
-            analisis: { arquetipo: "esceptico", confianza: 0.82,
-              borrador: "Sirve, y te digo cuándo no: si tus clientes llegan y compran sin " +
-                        "preguntar, no lo necesitas. ¿A ti te escriben antes de ir?",
-              dolor: "solo para negocios grandes", giro: "taquería" },
-            plan: { modo: "borrador", etiqueta: "Escéptico de giro ⭐ (PRUEBA)", accion: null },
-          });
-        }
-        return;
+  const trabajo = procesar(upd).catch(async (e) => {
+    console.error("ig-accion: fallo", e);
+    await tg.aviso(`⚠️ Copiloto IG: falló la acción — ${e.message}`).catch(() => {});
+  });
+
+  // Contestar 200 TERMINA la invocación en serverless: lo pendiente se congela sin dejar
+  // rastro. O la plataforma se hace cargo del trabajo, o se espera antes de responder.
+  if (!agendar(trabajo)) await trabajo;
+  return res.status(200).json({ ok: true });
+};
+
+async function procesar(upd) {
+  // A0) Mensaje suelto (no es respuesta a una propuesta). Sin esto el bot es un agujero
+  // negro: escribes y no contesta nada, que parece que está roto. Además devuelve el
+  // chat_id, que es justo el dato que hace falta para configurarlo.
+  if (upd.message && !upd.message.reply_to_message) {
+    const m = upd.message;
+    const chatId = m.chat.id;
+    const texto = (m.text || "").trim();
+    const ayuda =
+      "🤖 <b>Copiloto de comentarios</b> — estoy vivo.\n\n" +
+      "No soy conversacional: solo te aviso cuando alguien comenta en Instagram y te " +
+      "mando el borrador con botones.\n\n" +
+      "• <b>Enviar</b> publica el borrador tal cual\n" +
+      "• <b>Ocultar</b> esconde el comentario (no lo borra)\n" +
+      "• Para corregir: <b>responde</b> a mi mensaje con tu texto y publico el tuyo\n\n" +
+      `Manda <code>/prueba</code> para ver una propuesta de ejemplo.\n` +
+      `Tu <code>chat_id</code> es <code>${chatId}</code>`;
+    await tg.llamar("sendMessage", { chat_id: chatId, text: ayuda, parse_mode: "HTML" });
+    if (texto === "/prueba") {
+      await tg.propuesta({
+        commentId: "PRUEBA", autor: "un_prospecto", chatId,
+        texto: "¿Y esto sirve para una taquería o solo para negocios grandes?",
+        analisis: { arquetipo: "esceptico", confianza: 0.82,
+          borrador: "Sirve, y te digo cuándo no: si tus clientes llegan y compran sin " +
+                    "preguntar, no lo necesitas. ¿A ti te escriben antes de ir?",
+          dolor: "solo para negocios grandes", giro: "taquería" },
+        plan: { modo: "borrador", etiqueta: "Escéptico de giro ⭐ (PRUEBA)", accion: null },
+      });
     }
+    return;
+  }
 
-    // A) Edición: responder al mensaje de la propuesta con el texto corregido
-    if (upd.message?.reply_to_message) {
-      const orig = upd.message.reply_to_message;
-      const id = (orig.reply_markup?.inline_keyboard || [])
-        .flat()
-        .map((b) => String(b.callback_data || ""))
-        .find((d) => d.startsWith("send:") || d.startsWith("hide:"))
-        ?.split(":")[1];
-      const nuevo = (upd.message.text || "").trim();
-      if (id && nuevo) {
-        await ig.responder(id, nuevo);
-        await tg.aviso(`✅ Publicado con TU edición:\n${nuevo}`);
-      }
+  // A) Edición: responder al mensaje de la propuesta con el texto corregido
+  if (upd.message?.reply_to_message) {
+    const orig = upd.message.reply_to_message;
+    const id = (orig.reply_markup?.inline_keyboard || [])
+      .flat()
+      .map((b) => String(b.callback_data || ""))
+      .find((d) => d.startsWith("send:") || d.startsWith("hide:"))
+      ?.split(":")[1];
+    const nuevo = (upd.message.text || "").trim();
+    const chatId = upd.message.chat.id;
+    if (!id || !nuevo) return;
+    if (id === "PRUEBA") {
+      await tg.aviso(`🧪 Era una prueba: tu edición «${nuevo}» NO se publicó en Instagram.`, chatId);
       return;
     }
+    await ig.responder(id, nuevo);
+    await tg.aviso(`✅ Publicado con TU edición:\n${nuevo}`, chatId);
+    return;
+  }
 
-    // B) Botones
-    const cb = upd.callback_query;
-    if (!cb) return;
-    const [accion, commentId] = String(cb.data || "").split(":");
-    const texto = cb.message?.text || "";
-    let nota = "";
+  // B) Botones
+  const cb = upd.callback_query;
+  if (!cb) return;
+  const [accion, commentId] = String(cb.data || "").split(":");
+  const texto = cb.message?.text || "";
+  const chatId = cb.message?.chat?.id;
+  let nota = "";
 
-    if (accion === "send") {
-      const borrador = borradorDe(texto);
-      if (!borrador) {
-        nota = "no encontré el borrador";
+  // La propuesta de /prueba no toca Instagram: sirve para verificar la vuelta completa
+  // (Telegram → Vercel → acción) sin esperar a que alguien comente de verdad.
+  if (commentId === "PRUEBA") {
+    nota = `prueba ok — «${accion}» llegó al servidor`;
+  } else if (accion === "send") {
+    const borrador = borradorDe(texto);
+    if (!borrador) {
+      nota = "no encontré el borrador";
+    } else {
+      // Telegram reintenta el update si tardamos, y un reintento publicaría dos veces la
+      // misma respuesta con la cara de la marca. La verdad vive en el hilo, no acá.
+      const cuenta = await ig.yo().catch(() => null);
+      if (cuenta?.username && (await ig.yaRespondido(commentId, cuenta.username))) {
+        nota = "ya estaba respondido";
       } else {
         await ig.responder(commentId, borrador);
         nota = "publicado ✅";
       }
-    } else if (accion === "hide") {
-      await ig.ocultar(commentId);
-      nota = "oculto 🙈";
-    } else if (accion === "skip") {
-      nota = "ignorado";
-    } else {
-      nota = "acción desconocida";
     }
-
-    await tg.llamar("answerCallbackQuery", {
-      callback_query_id: cb.id, text: nota, chat_id: undefined,
-    });
-    // Se quitan los botones para que no se pueda publicar dos veces el mismo borrador.
-    await tg.llamar("editMessageReplyMarkup", {
-      message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] },
-    });
-    await tg.aviso(`↳ ${nota} · @${cb.from?.username || "tú"}` +
-                   (comentarioDe(texto) ? `\n(sobre: «${comentarioDe(texto).slice(0, 80)}»)` : ""));
-  } catch (e) {
-    console.error("ig-accion", e);
-    await tg.aviso(`⚠️ Copiloto IG: falló la acción — ${e.message}`);
+  } else if (accion === "hide") {
+    await ig.ocultar(commentId);
+    nota = "oculto 🙈";
+  } else if (accion === "skip") {
+    nota = "ignorado";
+  } else {
+    nota = "acción desconocida";
   }
-};
+
+  await tg.llamar("answerCallbackQuery", { callback_query_id: cb.id, text: nota });
+  // Se quitan los botones para que no se pueda publicar dos veces el mismo borrador.
+  await tg.llamar("editMessageReplyMarkup", {
+    chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] },
+  });
+  await tg.aviso(`↳ ${nota} · @${cb.from?.username || "tú"}` +
+                 (comentarioDe(texto) ? `\n(sobre: «${comentarioDe(texto).slice(0, 80)}»)` : ""),
+                 chatId);
+}
