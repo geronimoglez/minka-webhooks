@@ -101,6 +101,12 @@ const BASE = {
   check(/se abonan al precio de tu pase/i.test(conToken), "C: dice que se abona al pase");
   const pagado = graciasPage({ token: "1.5.999.x", cfg, query: { p: "ok" } });
   check(!pagado.includes("/postulacion/pago"), "C: ya pagado, no se vuelve a ofrecer el cobro");
+
+  // Sin pasarela configurada no se pinta un botón que llevaría a una página de error.
+  const sinPasarela = graciasPage({ token: "1.5.999.x", cfg: { ...cfg, pagoEnLinea: false }, query: {} });
+  check(!sinPasarela.includes("/postulacion/pago"), "C: sin Stripe no se ofrece el botón de pago");
+  check(sinPasarela.includes("Apartar por WhatsApp"), "C: sin Stripe se aparta por WhatsApp");
+  check(sinPasarela.includes("$100 MXN"), "C: sin Stripe se sigue diciendo el monto del apartado");
 }
 
 /* ──────────────────── D: documentos por firma real, no declarada ──────────────────── */

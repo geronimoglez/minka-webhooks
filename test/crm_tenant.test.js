@@ -106,7 +106,7 @@ async function main() {
   // D: la escritura viaja a la URL / DB / llave DEL TENANT
   {
     __resetCaches();
-    const st = fakeOdoo({ stageIds: { juanelo: { "Lead nuevo": 11 } } });
+    const st = fakeOdoo({ stageIds: { juanelo: { Nuevo: 11 } } });
     const r = await pushLead(
       { nombre: "Rosa", email: "rosa@x.com", whatsapp: "+52 33 1111 1111", negocio: "Estética Rosa" },
       { tenant: "juanelo", tags: ["postulacion"], note: "hola" });
@@ -125,7 +125,7 @@ async function main() {
   //    segundo tenant heredaría el id del primero y escribiría en una etapa de otra base.
   {
     __resetCaches();
-    const st = fakeOdoo({ stageIds: { juanelo: { "Lead nuevo": 11 }, crm: { "Lead nuevo": 3 } } });
+    const st = fakeOdoo({ stageIds: { juanelo: { Nuevo: 11 }, crm: { Nuevo: 3 } } });
     await pushLead({ nombre: "A", email: "a@x.com" }, { tenant: "juanelo", tags: ["postulacion"] });
     await pushLead({ nombre: "B", email: "b@x.com" }, { tags: ["postulacion"] }); // tenant global
     const leadJ = created(st, "juanelo", "crm.lead")[0];
@@ -135,6 +135,18 @@ async function main() {
     check(leadJ.stage_id !== leadG.stage_id, "E: los ids de etapa NO se filtran entre tenants");
     const stageSearches = st.ops.filter((o) => o.model === "crm.stage" && o.method === "search");
     check(stageSearches.length === 2, "E: cada tenant resuelve su propia etapa (2 búsquedas, no 1)");
+  }
+
+  // E2: los leads de postulación caen en el pipeline del CLIENTE ("Nuevo"), no en la etapa por
+  //     defecto en inglés que trae la plantilla de Odoo.
+  {
+    __resetCaches();
+    const st = fakeOdoo({ stageIds: { juanelo: { Nuevo: 20, New: 1 } } });
+    await pushLead({ nombre: "A", email: "a@x.com" },
+      { tenant: "juanelo", tags: ["postulacion", "iconos-belleza-iv"] });
+    const buscada = st.ops.find((o) => o.model === "crm.stage" && o.method === "search").args[0][0][2];
+    check(buscada === "Nuevo", "E2: una postulación busca la etapa 'Nuevo' del pipeline del cliente");
+    check(created(st, "juanelo", "crm.lead")[0].stage_id === 20, "E2: y el lead se crea en esa etapa");
   }
 
   // F: cache de uid separado — cada base autentica por su cuenta
