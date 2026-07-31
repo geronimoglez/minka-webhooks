@@ -14,6 +14,7 @@
 const ig = require("../lib/ig");
 const copiloto = require("../lib/copiloto");
 const tg = require("../lib/telegram");
+const tenants = require("../lib/tenants");
 const { agendar } = require("../lib/despues");
 
 // Vercel parsea el body y perdemos el crudo, que es lo que Meta firma. Se lee el stream.
@@ -71,10 +72,21 @@ module.exports = async (req, res) => {
 };
 
 async function procesar(payload) {
-  const cuenta = await ig.yo().catch(() => null);
-  const entradas = payload.entry || [];
+  for (const entry of payload.entry || []) {
+    // El id de la entrada dice de QUÉ CUENTA es el evento. Una cuenta sin registro se descarta:
+    // procesarla "por default" es publicar en la cuenta equivocada con el token de otro.
+    const tenant = tenants.porCuenta(entry.id);
+    if (!tenant) {
+      console.warn(`ig-comments: cuenta ${entry.id} sin tenant registrado, se descarta`);
+      continue;
+    }
+    if (!tenant.token) {
+      console.error(`ig-comments: tenant ${tenant.clave} sin token (falta ${tenant.tokenEnv})`);
+      continue;
+    }
+    const api = ig.cliente(tenant.token);
+    const cuenta = await api.yo().catch(() => null);
 
-  for (const entry of entradas) {
     for (const ch of entry.changes || []) {
       if (ch.field !== "comments") continue;
       const v = ch.value || {};
@@ -90,35 +102,38 @@ async function procesar(payload) {
 
       // Deduplicación contra el hilo real, no contra memoria local: en serverless no hay
       // estado que sobreviva a un arranque en frío, y Meta reintenta el webhook.
-      if (cuenta?.username && (await ig.yaRespondido(commentId, cuenta.username))) continue;
+      if (cuenta?.username && (await api.yaRespondido(commentId, cuenta.username))) continue;
 
       let contexto = "";
       try {
-        const c = await ig.getComentario(commentId);
+        const c = await api.getComentario(commentId);
         contexto = c?.media?.caption || "";
       } catch { /* el contexto es un lujo, no un requisito */ }
 
-      const analisis = await copiloto.analizar(texto, contexto);
+      const analisis = await copiloto.analizar(texto, contexto, tenant);
       const plan = copiloto.decidir(analisis);
       const autor = v.from?.username || "alguien";
+      const chat = tenant.chatId; // cada dueño aprueba en SU chat
 
       if (plan.accion === "ocultar" && plan.modo === "auto") {
-        await ig.ocultar(commentId).catch((e) => console.error("ocultar", e.message));
-        await tg.aviso(`🧹 Oculté spam de @${autor}: «${texto.slice(0, 120)}»`);
+        await api.ocultar(commentId).catch((e) => console.error("ocultar", e.message));
+        await tg.aviso(`🧹 Oculté spam de @${autor}: «${texto.slice(0, 120)}»`, chat);
         continue;
       }
 
       if (plan.modo === "auto") {
-        await ig.responder(commentId, analisis.borrador);
+        await api.responder(commentId, analisis.borrador);
         await tg.aviso(
           `✅ Respondí solo (${plan.etiqueta})\n\n@${autor}: «${texto.slice(0, 160)}»\n` +
-          `↳ ${analisis.borrador}`
+          `↳ ${analisis.borrador}`,
+          chat
         );
         continue;
       }
 
       // borrador o manual → a Telegram con botones
-      await tg.propuesta({ commentId, autor, texto, analisis, plan });
+      await tg.propuesta({ commentId, autor, texto, analisis, plan,
+                           tenant: tenant.clave, chatId: chat });
     }
   }
 }

@@ -160,7 +160,7 @@ pruebaAsync("el botón de PRUEBA no toca Instagram", async () => {
   try {
     await accion(
       { method: "POST", headers: { "x-telegram-bot-api-secret-token": "secreto-tg" },
-        body: { callback_query: { id: "cb1", data: "send:PRUEBA", from: { username: "gero" },
+        body: { callback_query: { id: "cb1", data: "send:prueba:PRUEBA", from: { username: "gero" },
           message: { message_id: 9, chat: { id: 7 }, text: "✍️ Borrador:\nhola" } } } },
       resFalso([])
     );
@@ -180,6 +180,103 @@ prueba("ningún endpoint contesta antes de agendar el trabajo", () => {
     assert.ok(!/res\.status\(200\)[^\n]*\n\n?\s*try \{/.test(t),
       `${f}: volvió el patrón "contesta 200 y después procesa" — en serverless eso no corre`);
   }
+});
+
+// ─── Aislamiento entre cuentas ────────────────────────────────────────────
+// El daño que este bloque previene es concreto: publicar en la cuenta de un cliente con el
+// token de otro, o mandarle a un dueño los comentarios del negocio del vecino.
+console.log("\nAislamiento entre cuentas (multi-tenant)");
+
+process.env.IG_TOKEN_A = "token-de-A";
+process.env.IG_TOKEN_B = "token-de-B";
+process.env.IG_COPILOTO_TENANTS = JSON.stringify({
+  "111": { clave: "a", handle: "cuenta_a", negocio: "Taller en Xalapa",
+           tokenEnv: "IG_TOKEN_A", chatId: "1001", voz: "Escribes como Juan.",
+           reglas: ["nunca prometer plazos"] },
+  "222": { clave: "b", handle: "cuenta_b", negocio: "Estética en Puebla",
+           tokenEnv: "IG_TOKEN_B", chatId: "2002", voz: "Escribes como Ana." },
+});
+const tenants = require("../lib/tenants");
+
+prueba("cada cuenta resuelve su propio token y su propio chat", () => {
+  const a = tenants.porCuenta("111"), b = tenants.porCuenta("222");
+  assert.strictEqual(a.token, "token-de-A");
+  assert.strictEqual(b.token, "token-de-B");
+  assert.notStrictEqual(a.chatId, b.chatId);
+});
+prueba("una cuenta sin registro no resuelve a nadie", () =>
+  assert.strictEqual(tenants.porCuenta("999"), null));
+prueba("el botón resuelve el tenant por su clave", () =>
+  assert.strictEqual(tenants.porClave("b").token, "token-de-B"));
+prueba("una clave inventada no resuelve a nadie", () =>
+  assert.strictEqual(tenants.porClave("zzz"), null));
+prueba("el registro roto no cae al tenant por defecto", () => {
+  const guardado = process.env.IG_COPILOTO_TENANTS;
+  process.env.IG_COPILOTO_TENANTS = "{esto no es json";
+  const r = tenants.porCuenta("111");
+  process.env.IG_COPILOTO_TENANTS = guardado;
+  assert.strictEqual(r, null, "con la config rota se publicaría en la cuenta equivocada");
+});
+prueba("la voz de un cliente no arrastra la de Minka", () => {
+  const s = copiloto.sistemaPara(tenants.porCuenta("111"));
+  assert.ok(/cuenta_a/.test(s) && /Taller en Xalapa/.test(s));
+  assert.ok(/nunca prometer plazos/.test(s), "las reglas de la casa deben entrar al prompt");
+  assert.ok(!/Minka|Gerónimo/.test(s), "se filtró la identidad de Minka al prompt del cliente");
+});
+prueba("un tenant no puede aflojar la compuerta", () => {
+  // Aunque la config del cliente pidiera automatizarlo todo, la compuerta es del motor.
+  assert.strictEqual(copiloto.decidir({ arquetipo: "precio", confianza: 1, borrador: "x" }).modo,
+    "borrador");
+  assert.strictEqual(copiloto.decidir({ arquetipo: "lead", confianza: 1, borrador: "x" }).modo,
+    "manual");
+});
+
+prueba("el token de A nunca sale hacia una llamada de B", () => {
+  const a = ig.cliente("token-de-A");
+  assert.ok(typeof a.responder === "function" && typeof a.yaRespondido === "function");
+  // La fábrica no expone el token: la única vía de usarlo es la instancia que lo recibió.
+  assert.strictEqual(a.token, undefined);
+});
+
+// Sin registro se mantiene el modo de cuenta única, para no romper @minka.one al desplegar.
+prueba("sin registro configurado se opera en modo de cuenta única", () => {
+  // Se acepta la entrada venga con el id que venga: una cuenta tiene dos ids y no está
+  // verificado cuál manda Meta. Filtrar por el equivocado dejaría al copiloto mudo.
+  const guardado = process.env.IG_COPILOTO_TENANTS;
+  delete process.env.IG_COPILOTO_TENANTS;
+  const t = tenants.porCuenta("17841400000000000");
+  process.env.IG_COPILOTO_TENANTS = guardado;
+  assert.ok(t && t.clave === "minka" && t.tokenEnv === "IG_ACCESS_TOKEN");
+});
+
+prueba("con registro, los DOS ids de una cuenta llevan al mismo tenant", () => {
+  // Se registran ambos (id app-scoped y user_id) porque no se sabe cuál llega en entry[].id.
+  const guardado = process.env.IG_COPILOTO_TENANTS;
+  const cfg = { clave: "a", handle: "cuenta_a", tokenEnv: "IG_TOKEN_A", chatId: "1001" };
+  process.env.IG_COPILOTO_TENANTS = JSON.stringify({ "28713": cfg, "17841": cfg });
+  const x = tenants.porCuenta("28713"), y = tenants.porCuenta("17841");
+  process.env.IG_COPILOTO_TENANTS = guardado;
+  assert.strictEqual(x.token, y.token);
+  assert.strictEqual(x.clave, y.clave);
+});
+
+prueba("el token no sale en un JSON.stringify del tenant", () => {
+  const t = tenants.porCuenta("111");
+  assert.strictEqual(t.token, "token-de-A", "sigue siendo legible por código");
+  assert.ok(!JSON.stringify(t).includes("token-de-A"), "el token se filtraría en cualquier log");
+});
+prueba("una clave con ':' no puede correr los campos del botón", () => {
+  const guardado = process.env.IG_COPILOTO_TENANTS;
+  process.env.IG_COPILOTO_TENANTS = JSON.stringify({
+    "333": { clave: "mala:clave", tokenEnv: "IG_TOKEN_A" },
+  });
+  const t = tenants.porCuenta("333");
+  process.env.IG_COPILOTO_TENANTS = guardado;
+  assert.ok(!t.clave.includes(":"), `clave saneada mal: ${t.clave}`);
+});
+prueba("el callback_data con tenant cabe en los 64 bytes de Telegram", () => {
+  const data = `send:cliente-largo:17841400000000000_18012345678901234`;
+  assert.ok(Buffer.byteLength(data) <= 64, `${Buffer.byteLength(data)} bytes`);
 });
 
 cola.then(() => {

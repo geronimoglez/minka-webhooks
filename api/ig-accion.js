@@ -11,6 +11,7 @@
 
 const ig = require("../lib/ig");
 const tg = require("../lib/telegram");
+const tenants = require("../lib/tenants");
 const { agendar } = require("../lib/despues");
 
 const SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
@@ -24,6 +25,25 @@ function borradorDe(texto) {
 function comentarioDe(texto) {
   const m = String(texto || "").match(/^\s*«([\s\S]*?)»\s*$/m);
   return m ? m[1] : "";
+}
+
+/**
+ * `accion:tenant:commentId`. Las propuestas viejas traen `accion:commentId` sin tenant y
+ * siguen sirviendo: pueden estar en el chat desde antes del multi-tenant.
+ */
+function leerRef(data) {
+  const p = String(data || "").split(":");
+  return p.length >= 3
+    ? { accion: p[0], clave: p[1], commentId: p.slice(2).join(":") }
+    : { accion: p[0], clave: null, commentId: p[1] || "" };
+}
+
+/** Cliente de Instagram del tenant al que pertenece este botón, o null si no se puede. */
+function apiDe(clave) {
+  const t = tenants.porClave(clave);
+  if (!t) { console.warn(`ig-accion: tenant «${clave}» desconocido`); return null; }
+  if (!t.token) { console.error(`ig-accion: tenant ${t.clave} sin token (${t.tokenEnv})`); return null; }
+  return ig.cliente(t.token);
 }
 
 module.exports = async (req, res) => {
@@ -69,7 +89,7 @@ async function procesar(upd) {
     await tg.llamar("sendMessage", { chat_id: chatId, text: ayuda, parse_mode: "HTML" });
     if (texto === "/prueba") {
       await tg.propuesta({
-        commentId: "PRUEBA", autor: "un_prospecto", chatId,
+        commentId: "PRUEBA", autor: "un_prospecto", chatId, tenant: "prueba",
         texto: "¿Y esto sirve para una taquería o solo para negocios grandes?",
         analisis: { arquetipo: "esceptico", confianza: 0.82,
           borrador: "Sirve, y te digo cuándo no: si tus clientes llegan y compran sin " +
@@ -84,19 +104,24 @@ async function procesar(upd) {
   // A) Edición: responder al mensaje de la propuesta con el texto corregido
   if (upd.message?.reply_to_message) {
     const orig = upd.message.reply_to_message;
-    const id = (orig.reply_markup?.inline_keyboard || [])
+    const data = (orig.reply_markup?.inline_keyboard || [])
       .flat()
       .map((b) => String(b.callback_data || ""))
-      .find((d) => d.startsWith("send:") || d.startsWith("hide:"))
-      ?.split(":")[1];
+      .find((d) => d.startsWith("send:") || d.startsWith("hide:"));
+    const { clave, commentId } = leerRef(data);
     const nuevo = (upd.message.text || "").trim();
     const chatId = upd.message.chat.id;
-    if (!id || !nuevo) return;
-    if (id === "PRUEBA") {
+    if (!commentId || !nuevo) return;
+    if (commentId === "PRUEBA") {
       await tg.aviso(`🧪 Era una prueba: tu edición «${nuevo}» NO se publicó en Instagram.`, chatId);
       return;
     }
-    await ig.responder(id, nuevo);
+    const api = apiDe(clave);
+    if (!api) {
+      await tg.aviso("⚠️ No pude identificar la cuenta de esa propuesta.", chatId);
+      return;
+    }
+    await api.responder(commentId, nuevo);
     await tg.aviso(`✅ Publicado con TU edición:\n${nuevo}`, chatId);
     return;
   }
@@ -104,7 +129,7 @@ async function procesar(upd) {
   // B) Botones
   const cb = upd.callback_query;
   if (!cb) return;
-  const [accion, commentId] = String(cb.data || "").split(":");
+  const { accion, clave, commentId } = leerRef(cb.data);
   const texto = cb.message?.text || "";
   const chatId = cb.message?.chat?.id;
   let nota = "";
@@ -113,28 +138,33 @@ async function procesar(upd) {
   // (Telegram → Vercel → acción) sin esperar a que alguien comente de verdad.
   if (commentId === "PRUEBA") {
     nota = `prueba ok — «${accion}» llegó al servidor`;
-  } else if (accion === "send") {
-    const borrador = borradorDe(texto);
-    if (!borrador) {
-      nota = "no encontré el borrador";
-    } else {
-      // Telegram reintenta el update si tardamos, y un reintento publicaría dos veces la
-      // misma respuesta con la cara de la marca. La verdad vive en el hilo, no acá.
-      const cuenta = await ig.yo().catch(() => null);
-      if (cuenta?.username && (await ig.yaRespondido(commentId, cuenta.username))) {
-        nota = "ya estaba respondido";
-      } else {
-        await ig.responder(commentId, borrador);
-        nota = "publicado ✅";
-      }
-    }
-  } else if (accion === "hide") {
-    await ig.ocultar(commentId);
-    nota = "oculto 🙈";
   } else if (accion === "skip") {
     nota = "ignorado";
-  } else {
+  } else if (accion !== "send" && accion !== "hide") {
     nota = "acción desconocida";
+  } else {
+    const api = apiDe(clave);
+    if (!api) {
+      nota = "no identifiqué la cuenta";
+    } else if (accion === "hide") {
+      await api.ocultar(commentId);
+      nota = "oculto 🙈";
+    } else {
+      const borrador = borradorDe(texto);
+      if (!borrador) {
+        nota = "no encontré el borrador";
+      } else {
+        // Telegram reintenta el update si tardamos, y un reintento publicaría dos veces la
+        // misma respuesta con la cara de la marca. La verdad vive en el hilo, no acá.
+        const cuenta = await api.yo().catch(() => null);
+        if (cuenta?.username && (await api.yaRespondido(commentId, cuenta.username))) {
+          nota = "ya estaba respondido";
+        } else {
+          await api.responder(commentId, borrador);
+          nota = "publicado ✅";
+        }
+      }
+    }
   }
 
   await tg.llamar("answerCallbackQuery", { callback_query_id: cb.id, text: nota });
