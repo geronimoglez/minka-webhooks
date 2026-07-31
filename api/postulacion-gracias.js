@@ -32,6 +32,8 @@ module.exports = async (req, res) => {
   return res.status(200).send(graciasPage({
     token: v.ok ? t : "",
     cfg,
+    // El estado del pago sale del token FIRMADO, no de la query string.
+    paid: Boolean(v.ok && v.paid),
     query: { d: String(q.d || ""), p: String(q.p || ""), n: String(q.n || "") },
   }));
 };

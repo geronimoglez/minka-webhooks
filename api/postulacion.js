@@ -16,10 +16,8 @@
 const crm = require("../lib/crm");
 const sign = require("../lib/sign");
 const { config } = require("../lib/evento");
+const aviso = require("../lib/aviso");
 const { formPage, FIELDS, setSecurityHeaders } = require("../lib/postulacion_html");
-
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
 
 const clip = (s, n) => String(s ?? "").slice(0, n).trim();
 
@@ -151,11 +149,29 @@ module.exports = async (req, res) => {
         source: "postulacion-web" },
       { tags, note: nota, tenant: cfg.tenant });
 
-    // Aviso interno SIEMPRE, haya o no CRM: es la red de seguridad que hace que ninguna
-    // postulación se pierda aunque Odoo esté dormido.
-    if (TG_TOKEN && TG_CHAT) {
-      const text = [
+    // Aviso interno. Cuánto se manda depende de si el CRM guardó (ver lib/aviso.js):
+    //
+    //  · guardó   → lo MÍNIMO. El expediente completo vive en Odoo, que es el sistema declarado en
+    //               el aviso de privacidad. Duplicar nombre, teléfono, correo y el relato de la
+    //               persona en un chat de Telegram es un destinatario extra que no aporta nada y
+    //               del que no hay forma de borrar nada después.
+    //  · no guardó → COMPLETO. Aquí el aviso ES la única copia de esa postulación; mandarlo
+    //               recortado sería perder a una persona por proteger un dato que de todos modos
+    //               ella nos dio para que la contactáramos.
+    if (crmRes.ok) {
+      await aviso.enviar([
         "✨ POSTULACIÓN — Íconos de la Belleza IV",
+        `Lead #${crmRes.id} · ${cfg.tenant} · ${v.ciudad}`,
+        v.tequila ? "🥃 Le interesa el extra del domingo" : "",
+        `Ábrelo en el CRM para ver sus datos y su trayectoria.`,
+      ].filter(Boolean).join("\n"), "postulacion");
+    } else {
+      console.error(`[postulacion] CRM falló (${safeDetail(crmRes.detail)}) — el lead viaja por Telegram`);
+      const ok = await aviso.enviar([
+        "⚠️ POSTULACIÓN SIN CRM — capturar a mano",
+        `El CRM (${cfg.tenant}) rechazó el alta: ${safeDetail(crmRes.detail)}`,
+        "Esta es la ÚNICA copia de esta postulación.",
+        "",
         `👤 ${v.nombre}${v.negocio ? ` · ${v.negocio}` : ""}`,
         `📱 ${v.whatsapp} · ${v.email}`,
         `📍 ${v.ciudad}${v.anios ? ` · ${v.anios} de trayectoria` : ""}`,
@@ -163,14 +179,8 @@ module.exports = async (req, res) => {
         v.tequila ? "🥃 Le interesa el extra del domingo" : "",
         "",
         v.trayectoria.slice(0, 700),
-        "",
-        crmRes.ok ? `✅ CRM (${cfg.tenant}) lead #${crmRes.id}`
-                  : `⚠️ CRM FALLÓ (${safeDetail(crmRes.detail)}) — capturar a mano`,
-      ].filter(Boolean).join("\n");
-      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: TG_CHAT, text }),
-      }).catch(() => {});
+      ].filter(Boolean).join("\n"), "postulacion");
+      if (!ok) console.error("[postulacion] ni CRM ni Telegram: POSTULACIÓN PERDIDA");
     }
 
     // Sin lead no hay a qué ligar el pago ni los documentos. La pantalla de gracias lo sabe y
@@ -186,6 +196,7 @@ module.exports = async (req, res) => {
                                     : "/postulacion/gracias");
     return res.status(303).end();
   } catch (e) {
+    console.error("[postulacion] fallo no controlado:", e && e.message);
     return res.status(500).send(formPage({
       values: {}, cfg,
       errors: { nombre: "Algo falló de nuestro lado. Vuelve a intentar o escríbenos por WhatsApp." },

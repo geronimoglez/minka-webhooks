@@ -14,6 +14,15 @@
 // el endpoint no atiende a nadie), para que ni siquiera se llegue a llamar a Stripe desde una
 // petición anónima.
 //
+// ⚠️ Ese secreto va en la QUERY STRING, así que hay que asumir que termina en los logs de acceso de
+// la plataforma, donde lo puede leer más gente que la que tiene acceso a las variables de entorno
+// (Stripe no permite cabeceras propias en sus endpoints de webhook, así que no hay dónde más
+// ponerlo). Por eso el secreto NO es la frontera de seguridad: es un portero que evita que
+// cualquiera nos haga gastar llamadas a Stripe. La frontera real es la re-consulta — con el secreto
+// filtrado, lo peor que consigue alguien es provocar una escritura idempotente de un pago que
+// Stripe confirma como cierto. Aun así conviene rotarlo cada tanto (ver .env.example).
+// Ship-review 2026-07-30.
+//
 // Por qué no se verifica la firma `Stripe-Signature`: hacerlo exige los BYTES EXACTOS del cuerpo, y
 // en el runtime Node de Vercel el cuerpo `application/json` ya viene parseado a objeto cuando el
 // handler corre — los bytes originales no se conservan, y re-serializar no reproduce la firma. En
@@ -67,10 +76,15 @@ module.exports = async (req, res) => {
     // 5xx = "vuelve a intentar". Stripe reintenta con backoff durante días, así que un Odoo dormido
     // o un hipo de red no pierden el registro del pago. `confirm` es idempotente: el reintento no
     // duplica nada.
-    if (!r.ok) return res.status(500).json({ ok: false, reason: r.reason });
+    if (!r.ok) {
+      console.error(`[stripe-webhook] ${tipo} sin registrar (${r.reason}) — se pide reintento a Stripe`);
+      return res.status(500).json({ ok: false, reason: r.reason });
+    }
 
     return res.status(200).json({ ok: true, paid: r.paid, deduped: Boolean(r.deduped) });
   } catch (e) {
+    // El camino del dinero es justo el que hay que poder depurar a las 3 de la mañana.
+    console.error("[stripe-webhook] fallo no controlado:", e && e.message);
     return res.status(500).json({ ok: false, reason: "handler-error" });
   }
 };

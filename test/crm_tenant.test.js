@@ -149,6 +149,26 @@ async function main() {
     check(created(st, "juanelo", "crm.lead")[0].stage_id === 20, "E2: y el lead se crea en esa etapa");
   }
 
+  // E3: los ids de tag también se cachean POR TENANT. Sin cache, cada postulación gastaba 3-4
+  //     round-trips a Odoo resolviendo los mismos tags fijos, en el camino crítico del usuario.
+  {
+    __resetCaches();
+    const st = fakeOdoo();
+    const tags = ["postulacion", "iconos-belleza-iv", "carrerasdeexito.com"];
+    await pushLead({ nombre: "A", email: "a@x.com" }, { tenant: "juanelo", tags });
+    const primera = st.ops.filter((o) => o.model === "crm.tag" && o.method === "search").length;
+    await pushLead({ nombre: "B", email: "b@x.com" }, { tenant: "juanelo", tags });
+    const total = st.ops.filter((o) => o.model === "crm.tag" && o.method === "search").length;
+    check(primera === 3, "E3: la primera postulación resuelve los 3 tags");
+    check(total === 3, "E3: la segunda NO vuelve a preguntar por ellos (cache)");
+    // ...pero otro tenant sí, porque los ids son de otra base
+    await pushLead({ nombre: "C", email: "c@x.com" }, { tags });
+    const conGlobal = st.ops.filter((o) => o.model === "crm.tag" && o.method === "search").length;
+    check(conGlobal === 6, "E3: otro tenant resuelve sus PROPIOS ids de tag (no hereda los ajenos)");
+    const creadosJuanelo = st.ops.filter((o) => o.db === "juanelo" && o.model === "crm.tag" && o.method === "create").length;
+    check(creadosJuanelo === 3, "E3: los tags se crean una sola vez por tenant");
+  }
+
   // F: cache de uid separado — cada base autentica por su cuenta
   {
     __resetCaches();

@@ -19,12 +19,21 @@ const { config } = require("../lib/evento");
 // Allowlist por tipo declarado Y por firma real del archivo. El content-type de una parte multipart
 // lo elige el cliente, así que por sí solo no prueba nada; los magic bytes sí. Con las dos, un .exe
 // renombrado a .jpg no entra al CRM.
+// HEIC comparte contenedor (ISO-BMFF) con MP4, MOV, M4A y 3GP: todos empiezan con la caja `ftyp`
+// en el offset 4. Quedarse ahí clasificaría un video como imagen — justo lo que la regla de negocio
+// "sin video" prohíbe, y con el agravante de guardarlo con extensión .heic. Lo que distingue a una
+// imagen es la MARCA PRINCIPAL (major brand, 4 bytes en el offset 8), así que se exige que esté en
+// esta lista. Ship-review 2026-07-30.
+const HEIC_BRANDS = new Set([
+  "heic", "heix", "heim", "heis", "hevc", "hevx", "hevm", "hevs", "mif1", "msf1",
+]);
+
 const KINDS = [
   { mime: "image/jpeg", ext: "jpg", magic: [[0xff, 0xd8, 0xff]] },
   { mime: "image/png", ext: "png", magic: [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]] },
   { mime: "application/pdf", ext: "pdf", magic: [[0x25, 0x50, 0x44, 0x46]] },
   { mime: "image/webp", ext: "webp", magic: [[0x52, 0x49, 0x46, 0x46]] }, // RIFF….WEBP
-  { mime: "image/heic", ext: "heic", magic: [[0x66, 0x74, 0x79, 0x70]], offset: 4 }, // ….ftyp
+  { mime: "image/heic", ext: "heic", magic: [[0x66, 0x74, 0x79, 0x70]], offset: 4 }, // ….ftyp<brand>
 ];
 
 function sniff(buf) {
@@ -32,7 +41,9 @@ function sniff(buf) {
     for (const m of k.magic) {
       const off = k.offset || 0;
       if (buf.length >= off + m.length && m.every((b, i) => buf[off + i] === b)) {
+        // RIFF es igual de genérico que ftyp: sin este chequeo, un .avi pasaría como WEBP.
         if (k.mime === "image/webp" && buf.subarray(8, 12).toString("latin1") !== "WEBP") continue;
+        if (k.mime === "image/heic" && !HEIC_BRANDS.has(buf.subarray(8, 12).toString("latin1"))) continue;
         return k;
       }
     }
@@ -74,7 +85,15 @@ module.exports = async (req, res) => {
     const docs = files.filter((f) => f.field === "documentos");
     if (!docs.length) return back(res, token, { d: "err" });
 
+    // Presupuesto de tiempo. Cada adjunto son 3 round-trips a Odoo, en serie; con 5 archivos y un
+    // Odoo tibio el total puede rebasar el maxDuration del endpoint (30 s en vercel.json). Si eso
+    // pasa, Vercel mata la función a media subida y la persona NO recibe ningún redirect: se queda
+    // sin saber si se guardaron 0, 2 o 4 documentos. Cortar antes y responder con lo que sí quedó es
+    // la versión honesta del mismo fallo. Ship-review 2026-07-30.
+    const DEADLINE = Date.now() + 22_000; // maxDuration 30 s, con margen para responder
+
     let guardados = 0;
+    let truncado = false;
     const stamp = new Date().toISOString().slice(0, 10);
     for (const [i, f] of docs.entries()) {
       const kind = sniff(f.data);
@@ -82,6 +101,7 @@ module.exports = async (req, res) => {
       if (!kind || kind.mime !== String(f.mimetype).split(";")[0].trim().toLowerCase()) {
         return back(res, token, { d: "tipo" });
       }
+      if (Date.now() > DEADLINE) { truncado = true; break; }
       // El nombre lo ponemos NOSOTROS. El del cliente es texto arbitrario y sólo se usa como
       // etiqueta dentro de la nota, ya escapado por Odoo. La extensión sale de la firma real.
       const filename = `postulacion-${v.leadId}-${stamp}-${i + 1}.${kind.ext}`;
@@ -92,8 +112,13 @@ module.exports = async (req, res) => {
         note: `Documento de trayectoria adjuntado por el postulante: ${filename}`,
       }, { tenant: cfg.tenant });
       if (r.ok) guardados++;
+      else console.error(`[documentos] adjunto ${i + 1} rechazado por el CRM: ${r.detail || "crm-error"}`);
     }
 
+    if (truncado) {
+      console.error(`[documentos] presupuesto agotado en el lead ${v.leadId}: ${guardados}/${docs.length} guardados`);
+      return back(res, token, guardados ? { d: "parcial", n: String(guardados) } : { d: "err" });
+    }
     if (!guardados) return back(res, token, { d: "err" });
     return back(res, token, { d: "ok", n: String(guardados) });
   } catch (e) {
@@ -101,6 +126,7 @@ module.exports = async (req, res) => {
     const code = m === "multipart-file-too-large" || m === "multipart-too-large" ? "big"
       : m === "multipart-too-many-files" ? "many"
       : "err";
+    if (code === "err") console.error("[documentos] fallo no controlado:", m);
     if (token) return back(res, token, { d: code });
     res.setHeader("Location", "/postulacion/gracias");
     return res.status(303).end();

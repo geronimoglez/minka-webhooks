@@ -10,8 +10,12 @@ Este proyecto **NO tiene conectado el auto-deploy de GitHub → Vercel**. Un `gi
 `main` **NO despliega nada** a producción. El deploy es manual, con la CLI de Vercel:
 
 ```powershell
-npm run deploy   # = vercel --prod --yes --scope geronimoglezs-projects
+npm run deploy   # = npm test && vercel --prod --yes --scope minkadigital
 ```
+
+`npm run deploy` corre la suite ANTES de desplegar: no se sube nada con tests en rojo.
+(El `--scope` decía `geronimoglezs-projects`, el nombre viejo del team antes de renombrarse a
+`minkadigital` — el deploy manual llevaba tiempo roto.)
 
 Prod alias: <https://minka-webhooks.vercel.app>
 

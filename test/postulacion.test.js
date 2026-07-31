@@ -99,8 +99,14 @@ const BASE = {
   check(conToken.includes("Minka Digital"), "C: avisa que el cargo aparece a nombre de Minka");
   check(/no se reembolsan|no es reembolsable/i.test(conToken), "C: dice que no es reembolsable");
   check(/se abonan al precio de tu pase/i.test(conToken), "C: dice que se abona al pase");
-  const pagado = graciasPage({ token: "1.5.999.x", cfg, query: { p: "ok" } });
+  // El estado de pago llega del token FIRMADO (parámetro `paid`), no de la query string.
+  const pagado = graciasPage({ token: "1.5.999.x", cfg, query: {}, paid: true });
   check(!pagado.includes("/postulacion/pago"), "C: ya pagado, no se vuelve a ofrecer el cobro");
+  check(pagado.includes("Lugar apartado"), "C: y se confirma el lugar");
+  // Sin respaldo del token, un ?p=ok en la URL no puede fingir el pago (ship-review 2026-07-30).
+  const fingido = graciasPage({ token: "1.5.999.x", cfg, query: { p: "ok" }, paid: false });
+  check(fingido.includes("/postulacion/pago"), "C: ?p=ok sin token que lo respalde NO finge el pago");
+  check(!fingido.includes("Lugar apartado"), "C: ni muestra el mensaje de confirmación");
 
   // Sin pasarela configurada no se pinta un botón que llevaría a una página de error.
   const sinPasarela = graciasPage({ token: "1.5.999.x", cfg: { ...cfg, pagoEnLinea: false }, query: {} });
@@ -125,6 +131,20 @@ const BASE = {
   check(sniff(exe) === null, "D: un ejecutable renombrado a .jpg NO pasa");
   check(sniff(Buffer.from("<?php echo 1; ?>")) === null, "D: un script no pasa");
   check(sniff(Buffer.alloc(2)) === null, "D: un archivo demasiado corto no pasa");
+
+  // HEIC comparte contenedor (ISO-BMFF, caja 'ftyp' en el offset 4) con MP4/MOV/M4A/3GP. Mirar sólo
+  // 'ftyp' clasificaba un VIDEO como imagen — justo lo que la regla "sin video" prohíbe.
+  // Ship-review 2026-07-30.
+  const isobmff = (brand) => Buffer.concat([
+    Buffer.from([0x00, 0x00, 0x00, 0x18]), Buffer.from("ftyp"), Buffer.from(brand),
+    Buffer.alloc(8),
+  ]);
+  for (const brand of ["heic", "heix", "mif1", "msf1"]) {
+    check(sniff(isobmff(brand)) && sniff(isobmff(brand)).ext === "heic", `D: acepta HEIC real (brand ${brand})`);
+  }
+  for (const brand of ["mp42", "isom", "qt  ", "M4A ", "3gp4", "avc1"]) {
+    check(sniff(isobmff(brand)) === null, `D: RECHAZA el contenedor de video/audio con brand ${JSON.stringify(brand)}`);
+  }
 }
 
 /* ─────────────────── E: codificación de formularios de Stripe ─────────────────── */

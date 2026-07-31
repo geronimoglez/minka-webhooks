@@ -9,8 +9,7 @@
 // nuevo para volver a la pantalla de gracias. Así nuestro token nunca queda guardado en Stripe.
 
 const sign = require("../lib/sign");
-const stripe = require("../lib/stripe");
-const { confirm } = require("../lib/apartado");
+const { confirm, fetchOwnSession } = require("../lib/apartado");
 const { config } = require("../lib/evento");
 const { avisoPage, setSecurityHeaders } = require("../lib/postulacion_html");
 
@@ -24,41 +23,48 @@ module.exports = async (req, res) => {
   const sessionId = String(q.s || "");
   const cancelado = String(q.c || "") === "1";
 
-  const irAGracias = (leadId, p) => {
+  // El token de vuelta lleva FIRMADO si el lugar ya está pagado, para que la pantalla de gracias no
+  // tenga que creerle a un parámetro de la URL.
+  const irAGracias = (leadId, p, paid = false) => {
     let t = "";
-    try { t = sign.issue(leadId, { secret: process.env.POSTULACION_TOKEN_SECRET }); } catch { t = ""; }
+    try { t = sign.issue(leadId, { secret: process.env.POSTULACION_TOKEN_SECRET, paid }); } catch { t = ""; }
     const qs = new URLSearchParams(t ? { t, p } : { p }).toString();
     res.setHeader("Location", `/postulacion/gracias?${qs}`);
     return res.status(303).end();
   };
-
-  // Cancelación: no se toca el CRM. Sólo se recupera a qué lead volver.
-  if (cancelado) {
-    if (!stripe.isSessionId(sessionId)) {
-      res.setHeader("Location", "/postulacion/gracias?p=no");
-      return res.status(303).end();
-    }
-    try {
-      const s = await stripe.retrieveSession(sessionId);
-      const leadId = Number(s.metadata && s.metadata.leadId);
-      if (Number.isSafeInteger(leadId) && leadId > 0) return irAGracias(leadId, "no");
-    } catch { /* da igual por qué: se cae al camino sin token */ }
-    res.setHeader("Location", "/postulacion/gracias?p=no");
+  const sinToken = (p) => {
+    res.setHeader("Location", `/postulacion/gracias?p=${p}`);
     return res.status(303).end();
+  };
+
+  // Cancelación: no se toca el CRM. Sólo se recupera a qué lead volver — pero pasando por la MISMA
+  // validación de pertenencia que el camino de confirmación (`fetchOwnSession`). Sin ella, un id de
+  // sesión ajeno (de otro cliente que comparta la cuenta de Stripe de Minka, o uno filtrado en una
+  // captura de pantalla) bastaba para que emitiéramos un token firmado del lead de otra persona —
+  // y con ese token se le podían adjuntar documentos a su expediente. Ship-review 2026-07-30.
+  if (cancelado) {
+    const own = await fetchOwnSession(sessionId, cfg);
+    if (!own.ok) {
+      console.error(`[pagado] cancelación con sesión no propia: ${own.reason}`);
+      return sinToken("no");
+    }
+    return irAGracias(own.leadId, "no", false);
   }
 
   const r = await confirm(sessionId, cfg);
 
-  if (r.ok && r.paid && r.leadId) return irAGracias(r.leadId, "ok");
+  // Pagado y registrado.
+  if (r.ok && r.paid && r.leadId) return irAGracias(r.leadId, "ok", true);
   // Pagado pero no lo pudimos registrar: el dinero ya se cobró, así que NO se le dice a la persona
-  // que falló su pago. Se le confirma y el problema se resuelve del lado nuestro (el webhook
-  // reintenta, y el aviso de Telegram ya alertó).
-  if (r.paid && r.leadId) return irAGracias(r.leadId, "ok");
+  // que falló su pago. Se le confirma —el cobro es real— y el problema se resuelve del lado
+  // nuestro (el webhook reintenta, y el aviso interno ya alertó).
+  if (r.paid && r.leadId) return irAGracias(r.leadId, "ok", true);
+  // Aún sin pagar (métodos diferidos como OXXO/SPEI): se vuelve con token pero sin marcar pagado.
   if (r.ok && !r.paid) {
-    res.setHeader("Location", "/postulacion/gracias?p=pend");
-    return res.status(303).end();
+    return r.leadId ? irAGracias(r.leadId, "pend", false) : sinToken("pend");
   }
 
+  console.error(`[pagado] no se pudo confirmar la sesión: ${r.reason}`);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   return res.status(200).send(avisoPage({
     cfg,

@@ -5,7 +5,7 @@
   "description": "Endpoints serverless de Minka Digital (diagnóstico P0, onboarding, portal, embudo de postulación) — CRM Odoo",
   "scripts": {
     "dev": "vercel dev",
-    "test": "node test/crm_retry.test.js && node test/crm_tenant.test.js && node test/multipart.test.js && node test/postulacion.test.js && node test/onboarding_cmd.test.js && node test/diagnostico_html.test.js",
+    "test": "node test/crm_retry.test.js && node test/crm_tenant.test.js && node test/multipart.test.js && node test/sign.test.js && node test/postulacion.test.js && node test/handlers.test.js && node test/onboarding_cmd.test.js && node test/diagnostico_html.test.js",
     "deploy": "npm test && vercel --prod --yes --scope minkadigital"
   },
   "engines": {
