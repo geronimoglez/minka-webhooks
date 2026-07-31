@@ -37,6 +37,37 @@ module.exports = async (req, res) => {
   res.status(200).json({ ok: true }); // Telegram reintenta ante demora: se contesta ya
 
   try {
+    // A0) Mensaje suelto (no es respuesta a una propuesta). Sin esto el bot es un agujero
+    // negro: escribes y no contesta nada, que parece que está roto. Además devuelve el
+    // chat_id, que es justo el dato que hace falta para configurarlo.
+    if (upd.message && !upd.message.reply_to_message) {
+        const m = upd.message;
+        const texto = (m.text || "").trim();
+        const ayuda =
+          "🤖 <b>Copiloto de comentarios</b> — estoy vivo.\n\n" +
+          "No soy conversacional: solo te aviso cuando alguien comenta en Instagram y te " +
+          "mando el borrador con botones.\n\n" +
+          "• <b>Enviar</b> publica el borrador tal cual\n" +
+          "• <b>Ocultar</b> esconde el comentario (no lo borra)\n" +
+          "• Para corregir: <b>responde</b> a mi mensaje con tu texto y publico el tuyo\n\n" +
+          `Tu <code>chat_id</code> es <code>${m.chat.id}</code>`;
+        await tg.llamar("sendMessage", {
+          chat_id: m.chat.id, text: ayuda, parse_mode: "HTML",
+        });
+        if (texto === "/prueba") {
+          await tg.propuesta({
+            commentId: "PRUEBA", autor: "un_prospecto",
+            texto: "¿Y esto sirve para una taquería o solo para negocios grandes?",
+            analisis: { arquetipo: "esceptico", confianza: 0.82,
+              borrador: "Sirve, y te digo cuándo no: si tus clientes llegan y compran sin " +
+                        "preguntar, no lo necesitas. ¿A ti te escriben antes de ir?",
+              dolor: "solo para negocios grandes", giro: "taquería" },
+            plan: { modo: "borrador", etiqueta: "Escéptico de giro ⭐ (PRUEBA)", accion: null },
+          });
+        }
+        return;
+    }
+
     // A) Edición: responder al mensaje de la propuesta con el texto corregido
     if (upd.message?.reply_to_message) {
       const orig = upd.message.reply_to_message;
