@@ -15,6 +15,24 @@
     },
     "api/ig-accion.js": {
       "maxDuration": 15
+    },
+    "api/postulacion.js": {
+      "maxDuration": 20
+    },
+    "api/postulacion-gracias.js": {
+      "maxDuration": 5
+    },
+    "api/postulacion-documentos.js": {
+      "maxDuration": 30
+    },
+    "api/postulacion-pago.js": {
+      "maxDuration": 15
+    },
+    "api/postulacion-pagado.js": {
+      "maxDuration": 25
+    },
+    "api/stripe-webhook.js": {
+      "maxDuration": 30
     }
   }
 }

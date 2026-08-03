@@ -2,7 +2,7 @@
   "name": "minka-webhooks",
   "version": "0.1.0",
   "private": true,
-  "description": "Endpoints serverless de Minka Digital (diagnóstico P0, onboarding, portal) — CRM Odoo",
+  "description": "Endpoints serverless de Minka Digital (diagnóstico P0, onboarding, portal, embudo de postulación) — CRM Odoo",
   "scripts": {
     "dev": "vercel dev",
     "test": "for f in test/*.test.js; do node \"$f\" || exit 1; done",
