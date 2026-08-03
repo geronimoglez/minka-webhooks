@@ -19,7 +19,7 @@ process.env.ODOO_WAKE_BACKOFF_MS = "5";
 process.env.ODOO_WAKE_MAX_MS = "500";
 
 const CRM_PATH = require.resolve("../lib/crm.js");
-let { odooRpc, pushLead, findByEmail, escLike, __resetUid } = require(CRM_PATH);
+let { odooRpc, pushLead, findByEmail, sendLeadEmail, escLike, __resetUid } = require(CRM_PATH);
 
 let pass = 0, fail = 0;
 function check(cond, label) {
@@ -126,6 +126,80 @@ async function main() {
     const pattern = domain[0][0][2];
     check(pattern === "\\%@\\%", "G: el dominio =ilike lleva el patrón escapado");
     check(!/(^|[^\\])%/.test(pattern), "G: no queda ningún % sin escapar en el patrón");
+  }
+
+  // I: sendLeadEmail (FASE 2) — el correo del diagnóstico sale por mail.mail/minka_ses y queda en el
+  //    chatter. Se verifican los args EXACTOS que viajan a Odoo, porque son los que deciden si el
+  //    correo sale y si un fallo es visible.
+  {
+    __resetUid();
+    const st = mockFetch([{ result: 3 }, { result: 88 }, { result: true }, { result: 1 }]);
+    const r = await sendLeadEmail(41, { to: "ana@ejemplo.com", subject: "Tu diagnóstico digital, Tacos Ana",
+      html: "<p>hola</p>", replyTo: "hola@minkadigital.com" });
+    check(r.ok === true && r.mailId === 88, "I: sendLeadEmail devuelve el id del mail.mail creado");
+    const create = JSON.parse(st.bodies[1]).params.args;
+    check(create[3] === "mail.mail" && create[4] === "create", "I: crea un mail.mail (mismo camino que p0_nurture.py)");
+    const vals = create[5][0];
+    check(vals.email_to === "ana@ejemplo.com" && vals.body_html === "<p>hola</p>", "I: destinatario y cuerpo correctos");
+    check(!("email_from" in vals),
+      "I: sin email_from → usa la identidad que Odoo ya tiene verificada en SES (no rompe la reputación)");
+    check(vals.reply_to === "hola@minkadigital.com", "I: reply_to a un buzón que se lee");
+    check(vals.auto_delete === false, "I: el registro sobrevive al envío (bitácora auditable)");
+    const send = JSON.parse(st.bodies[2]).params.args;
+    check(send[4] === "send" && send[6].raise_exception === true,
+      "I: send con raise_exception → un rechazo de SES NO queda invisible");
+    const post = JSON.parse(st.bodies[3]).params.args;
+    check(post[3] === "crm.lead" && post[4] === "message_post" && post[5][0][0] === 41,
+      "I: y queda registrado en el chatter del lead");
+  }
+
+  // J: si el envío falla, sendLeadEmail NO lanza (es trabajo de segundo plano) y el detail va saneado.
+  {
+    __resetUid();
+    mockFetch([{ result: 3 }, { result: 88 }, { error: { data: {
+      name: "odoo.addons.mail.models.MailDeliveryException",
+      message: "Email delivery failed for ana@ejemplo.com: 554 Message rejected",
+    } } }]);
+    const r = await sendLeadEmail(41, { to: "ana@ejemplo.com", subject: "s", html: "<p>x</p>" });
+    check(r.ok === false, "J: fallo de envío se reporta honesto (ok:false), sin lanzar");
+    check(r.detail === "odoo-rejected:MailDeliveryException", "J: detail es el token saneado");
+    check(!r.detail.includes("ana@ejemplo.com"), "J: el detail NO filtra el correo del prospecto");
+  }
+
+  // K: guardas de entrada — el formulario es PÚBLICO y estos valores acaban en cabeceras de correo.
+  {
+    const st = mockFetch([{ result: 3 }]);
+    const bad = [
+      ["no-es-un-correo", "sin @"],
+      ["", "vacío"],
+      // email_to de Odoo acepta lista: sin la guarda, el formulario sería un relay a terceros.
+      ["yo@x.com,victima@y.com", "lista de destinatarios"],
+      ["yo@x.com victima@y.com", "dos direcciones separadas por espacio"],
+      // inyección de cabeceras: un \n en el destinatario mete un Bcc propio.
+      ["yo@x.com\nBcc: victima@y.com", "salto de línea (inyección de cabecera)"],
+    ];
+    let allBlocked = true;
+    for (const [to] of bad) {
+      const r = await sendLeadEmail(41, { to, html: "<p>x</p>" });
+      if (r.ok !== false) allBlocked = false;
+    }
+    const r2 = await sendLeadEmail(41, { to: "ana@ejemplo.com", html: "" });
+    check(allBlocked, `K: se rechazan los ${bad.length} destinatarios peligrosos (${bad.map((b) => b[1]).join(", ")})`);
+    check(r2.ok === false, "K: cuerpo vacío → ok:false");
+    check(st.n === 0, "K: y ni siquiera se llama a Odoo");
+  }
+
+  // L: el ASUNTO lleva el nombre del negocio, que lo escribe el visitante → se limpia antes de
+  //    viajar a Odoo (si no, un \n en el asunto inyecta cabeceras en el correo saliente).
+  {
+    __resetUid();
+    const st = mockFetch([{ result: 3 }, { result: 90 }, { result: true }, { result: 1 }]);
+    await sendLeadEmail(41, { to: "ana@ejemplo.com", html: "<p>x</p>",
+      subject: "Tu diagnóstico, Tacos\r\nBcc: victima@y.com" });
+    const vals = JSON.parse(st.bodies[1]).params.args[5][0];
+    check(!/[\r\n]/.test(vals.subject), "L: el asunto viaja sin saltos de línea");
+    check(vals.subject === "Tu diagnóstico, Tacos Bcc: victima@y.com",
+      "L: el intento de inyección queda como texto plano del asunto");
   }
 
   // C: presupuesto total agotado → el retry se corta (re-require con MAX chico y backoff que lo excede)

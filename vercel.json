@@ -2,13 +2,19 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/diagnostico.js": {
-      "maxDuration": 60
+      "maxDuration": 75
     },
     "api/onboarding.js": {
       "maxDuration": 15
     },
     "api/portal-status.js": {
       "maxDuration": 10
+    },
+    "api/ig-comments.js": {
+      "maxDuration": 30
+    },
+    "api/ig-accion.js": {
+      "maxDuration": 15
     },
     "api/postulacion.js": {
       "maxDuration": 20
